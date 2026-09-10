@@ -145,6 +145,7 @@ class GuildMusic:
         self.paused_since = None
         self.paused_total = 0.0
         self.update_task = None
+        self.disconnect_task = None
 
 
 guild_music = {}
@@ -372,6 +373,54 @@ async def now_playing_updater(guild_id):
 
 
 # ============================================================
+# AUTO-DISCONNECT NACH 15 MINUTEN OHNE MUSIK
+# ============================================================
+AUTO_DISCONNECT_DELAY = 15 * 60  # 15 Minuten
+
+
+async def auto_disconnect_after_idle(guild):
+    music = get_music(guild.id)
+
+    try:
+        print(f"[{guild.name}] Keine Musik mehr -> Auto-Disconnect in 15 Minuten.")
+
+        await asyncio.sleep(AUTO_DISCONNECT_DELAY)
+
+        # Prüfen, ob während der 15 Minuten wieder Musik gestartet wurde.
+        if music.playing or music.starting_song or music.queue:
+            print(f"[{guild.name}] Wieder Musik vorhanden -> Auto-Disconnect abgebrochen.")
+            return
+
+        vc = guild.voice_client
+
+        if vc is not None and vc.is_connected():
+            print(
+                f"[{guild.name}] 15 Minuten ohne Musik -> "
+                "Bot verlässt den Voice-Channel."
+            )
+            await vc.disconnect()
+
+        music.voice_client = None
+        music.current = None
+        music.playing = False
+        music.starting_song = False
+        music.now_playing_message = None
+
+    except asyncio.CancelledError:
+        print(f"[{guild.name}] Auto-Disconnect Timer abgebrochen.")
+        raise
+
+    except Exception as error:
+        print(
+            f"[{guild.name}] Fehler beim Auto-Disconnect: "
+            f"{type(error).__name__}: {error}"
+        )
+
+    finally:
+        music.disconnect_task = None
+
+
+# ============================================================
 # SONG ABSPIELEN
 # ============================================================
 async def play_next(guild):
@@ -389,6 +438,16 @@ async def play_next(guild):
         music.playing = False
         music.current = None
         print(f"Queue von {guild.name} ist leer.")
+
+        # Alten Auto-Disconnect-Timer abbrechen, falls vorhanden.
+        if music.disconnect_task and not music.disconnect_task.done():
+            music.disconnect_task.cancel()
+
+        # Nach 15 Minuten ohne neue Musik automatisch den Call verlassen.
+        music.disconnect_task = asyncio.create_task(
+            auto_disconnect_after_idle(guild)
+        )
+
         return
 
     music.starting_song = True
@@ -570,6 +629,10 @@ class MusicView(discord.ui.View):
         if music.update_task and not music.update_task.done():
             music.update_task.cancel()
 
+        if music.disconnect_task and not music.disconnect_task.done():
+            music.disconnect_task.cancel()
+            music.disconnect_task = None
+
         vc = interaction.guild.voice_client
 
         if vc is not None:
@@ -739,6 +802,11 @@ async def play(interaction: discord.Interaction, song: str):
     music = get_music(interaction.guild.id)
     music.text_channel = interaction.channel
 
+    # Neue Musik angefordert -> Auto-Disconnect-Timer abbrechen.
+    if music.disconnect_task and not music.disconnect_task.done():
+        music.disconnect_task.cancel()
+        music.disconnect_task = None
+
     # ========================================================
     # SONG SUCHEN
     # ========================================================
@@ -879,6 +947,10 @@ async def stop(interaction: discord.Interaction):
 
     if music.update_task and not music.update_task.done():
         music.update_task.cancel()
+
+    if music.disconnect_task and not music.disconnect_task.done():
+        music.disconnect_task.cancel()
+        music.disconnect_task = None
 
     vc = interaction.guild.voice_client
 
