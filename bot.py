@@ -758,6 +758,7 @@ class MusicView(discord.ui.View):
         await interaction.response.send_message(
             f"🔉 Lautstärke: **{int(music.volume * 100)}%**",
             ephemeral=True,
+            delete_after=5,
         )
 
     @discord.ui.button(label="Lauter", emoji="🔊", style=discord.ButtonStyle.secondary, row=1)
@@ -772,6 +773,7 @@ class MusicView(discord.ui.View):
         await interaction.response.send_message(
             f"🔊 Lautstärke: **{int(music.volume * 100)}%**",
             ephemeral=True,
+            delete_after=5,
         )
 
     @discord.ui.button(label="Repeat: Aus", emoji="🔁", style=discord.ButtonStyle.secondary, row=1)
