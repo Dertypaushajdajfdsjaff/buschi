@@ -347,15 +347,40 @@ async def get_audio_url(webpage_url):
         with yt_dlp.YoutubeDL(YTDL_AUDIO_OPTIONS) as ydl:
             info = ydl.extract_info(webpage_url, download=False)
 
+            # yt-dlp hängt an info["url"] eine googlevideo.com-Adresse, die an
+            # den PO-Token/Client-Kontext gebunden ist. Ohne die exakt
+            # gleichen Request-Header (v.a. User-Agent) lehnt YouTubes CDN
+            # den Zugriff durch ffmpeg mit 403 Forbidden ab.
             return {
                 "url": info["url"],
                 "title": info.get("title", "Unbekannter Song"),
                 "webpage_url": info.get("webpage_url", webpage_url),
                 "thumbnail": info.get("thumbnail"),
                 "duration": info.get("duration"),
+                "http_headers": info.get("http_headers") or {},
             }
 
     return await _run_with_retries(extract, timeout=45, label="Audio-Extraktion")
+
+
+def build_ffmpeg_options(http_headers):
+    """Baut pro Song passende ffmpeg-Optionen inkl. der Request-Header, mit
+    denen yt-dlp die Stream-URL geholt hat. Fehlen die, liefert YouTubes CDN
+    für die googlevideo.com-URL oft ein 403 Forbidden."""
+    headers = dict(http_headers or {})
+    headers.setdefault("User-Agent", YTDLP_USER_AGENT)
+
+    header_block = "".join(f"{key}: {value}\r\n" for key, value in headers.items())
+
+    return {
+        "before_options": (
+            "-reconnect 1 "
+            "-reconnect_streamed 1 "
+            "-reconnect_delay_max 5 "
+            f'-headers "{header_block}"'
+        ),
+        "options": "-vn",
+    }
 
 
 def is_youtube_bot_block(error):
@@ -543,7 +568,7 @@ async def play_next(guild):
 
         raw_source = discord.FFmpegPCMAudio(
             audio["url"],
-            **FFMPEG_OPTIONS,
+            **build_ffmpeg_options(audio.get("http_headers")),
         )
         source = discord.PCMVolumeTransformer(raw_source, volume=music.volume)
 
