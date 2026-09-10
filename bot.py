@@ -136,6 +136,16 @@ class GuildMusic:
         self.playing = False
         self.starting_song = False
 
+        # Für das erweiterte "Now Playing"-Widget:
+        self.volume = 1.0
+        self.repeat = False
+        self.liked = set()  # Titel gemochter Songs (nur im RAM, pro Session)
+        self.now_playing_message = None
+        self.start_time = None
+        self.paused_since = None
+        self.paused_total = 0.0
+        self.update_task = None
+
 
 guild_music = {}
 
@@ -284,26 +294,81 @@ async def get_audio_url(webpage_url):
     return await _run_with_retries(extract, timeout=45, label="Audio-Extraktion")
 
 
-# ============================================================
-# MUSIC EMBED
-# ============================================================
-def create_music_embed(title, channel_name, thumbnail=None):
+def format_duration(seconds):
+    if seconds is None:
+        return "--:--"
+    seconds = max(0, int(seconds))
+    minutes, secs = divmod(seconds, 60)
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def build_progress_bar(elapsed, duration, length=18):
+    if not duration or duration <= 0:
+        return "▬" * length
+    frac = max(0.0, min(1.0, elapsed / duration))
+    pos = int(frac * (length - 1))
+    return "▬" * pos + "🔘" + "▬" * (length - 1 - pos)
+
+
+def get_elapsed_seconds(music):
+    if music.start_time is None:
+        return 0
+    if music.voice_client and music.voice_client.is_paused() and music.paused_since:
+        return music.paused_since - music.start_time - music.paused_total
+    return time.time() - music.start_time - music.paused_total
+
+
+def create_music_embed(music, channel_name):
+    song = music.current
+    elapsed = get_elapsed_seconds(music)
+    duration = song.get("duration")
+    bar = build_progress_bar(elapsed, duration)
+    time_text = f"{format_duration(elapsed)} / {format_duration(duration)}"
+    liked = song["title"] in music.liked
+
     embed = discord.Embed(
         title="🎵  Now Playing",
         description=(
-            f"**{title}**\n\n"
-            f"🔊 **Voice:** {channel_name}\n\n"
-            "────────────────────\n"
-            "🎧 Viel Spaß beim Hören!"
+            f"**{song['title']}**\n\n"
+            f"{bar}\n"
+            f"`{time_text}`\n\n"
+            f"🔊 **Voice:** {channel_name}\n"
+            f"🔉 **Lautstärke:** {int(music.volume * 100)}%   •   "
+            f"🔁 **Wiederholen:** {'An' if music.repeat else 'Aus'}   •   "
+            f"{'❤️' if liked else '🤍'} **Geliked:** {'Ja' if liked else 'Nein'}"
         ),
         color=discord.Color.blurple(),
     )
 
-    if thumbnail:
-        embed.set_thumbnail(url=thumbnail)
+    if song.get("thumbnail"):
+        embed.set_thumbnail(url=song["thumbnail"])
 
     embed.set_footer(text="Music Bot • YouTube")
     return embed
+
+
+async def now_playing_updater(guild_id):
+    """Aktualisiert die 'Now Playing'-Nachricht alle paar Sekunden mit
+    Fortschrittsbalken/Zeit, solange derselbe Song noch läuft."""
+    music = get_music(guild_id)
+    song_ref = music.current
+
+    while (
+        music.current is song_ref
+        and music.now_playing_message is not None
+        and music.voice_client is not None
+        and music.voice_client.is_connected()
+    ):
+        try:
+            embed = create_music_embed(music, music.voice_client.channel.name)
+            await music.now_playing_message.edit(embed=embed)
+        except discord.HTTPException:
+            pass
+        except Exception as error:
+            print(f"Fehler beim Aktualisieren des Now-Playing-Widgets: {repr(error)}")
+            break
+
+        await asyncio.sleep(5)
 
 
 # ============================================================
@@ -332,14 +397,18 @@ async def play_next(guild):
 
     try:
         audio = await get_audio_url(song["webpage_url"])
+        # Duration ggf. aus der frischen Extraktion übernehmen (genauer als Suchergebnis).
+        if audio.get("duration"):
+            song["duration"] = audio["duration"]
 
         if music.voice_client is None or not music.voice_client.is_connected():
             raise RuntimeError("Der Voice-Client ist nicht mehr verbunden.")
 
-        source = discord.FFmpegPCMAudio(
+        raw_source = discord.FFmpegPCMAudio(
             audio["url"],
             **FFMPEG_OPTIONS,
         )
+        source = discord.PCMVolumeTransformer(raw_source, volume=music.volume)
 
         def after_play(error):
             if error:
@@ -353,17 +422,20 @@ async def play_next(guild):
         music.voice_client.play(source, after=after_play)
         music.playing = True
         music.history.appendleft(song)
+        music.start_time = time.time()
+        music.paused_since = None
+        music.paused_total = 0.0
+
+        if music.update_task and not music.update_task.done():
+            music.update_task.cancel()
 
         if music.text_channel:
-            embed = create_music_embed(
-                song["title"],
-                music.voice_client.channel.name,
-                song.get("thumbnail"),
-            )
-            await music.text_channel.send(
+            embed = create_music_embed(music, music.voice_client.channel.name)
+            music.now_playing_message = await music.text_channel.send(
                 embed=embed,
                 view=MusicView(guild.id),
             )
+            music.update_task = asyncio.create_task(now_playing_updater(guild.id))
 
         print(f"Spiele: {song['title']}")
 
@@ -396,8 +468,14 @@ async def play_next(guild):
 
 async def song_finished(guild):
     music = get_music(guild.id)
+    finished_song = music.current
     music.playing = False
     music.current = None
+
+    # Bei aktivem Repeat den gerade beendeten Song vorne wieder einreihen.
+    if music.repeat and finished_song:
+        music.queue.appendleft(finished_song)
+
     await asyncio.sleep(0.5)
     await play_next(guild)
 
@@ -410,8 +488,31 @@ class MusicView(discord.ui.View):
         super().__init__(timeout=None)
         self.guild_id = guild_id
 
-    @discord.ui.button(label="Pause", emoji="⏸️", style=discord.ButtonStyle.primary)
+    # ---------- Reihe 1 ----------
+    @discord.ui.button(label="Zurück", emoji="⏮️", style=discord.ButtonStyle.secondary, row=0)
+    async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        music = get_music(self.guild_id)
+        vc = interaction.guild.voice_client
+
+        if vc is None or len(music.history) < 2:
+            await interaction.response.send_message(
+                "❌ Es gibt keinen vorherigen Song.",
+                ephemeral=True,
+            )
+            return
+
+        previous_song = music.history[1]
+        music.queue.appendleft(previous_song)
+        vc.stop()  # löst after_play -> song_finished -> play_next aus
+
+        await interaction.response.send_message(
+            f"⏮️ Spiele erneut: **{previous_song['title']}**",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Pause", emoji="⏸️", style=discord.ButtonStyle.primary, row=0)
     async def pause_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        music = get_music(self.guild_id)
         vc = interaction.guild.voice_client
 
         if vc is None:
@@ -423,6 +524,7 @@ class MusicView(discord.ui.View):
 
         if vc.is_playing():
             vc.pause()
+            music.paused_since = time.time()
             button.label = "Fortsetzen"
             button.emoji = "▶️"
             await interaction.response.edit_message(view=self)
@@ -430,6 +532,9 @@ class MusicView(discord.ui.View):
 
         if vc.is_paused():
             vc.resume()
+            if music.paused_since:
+                music.paused_total += time.time() - music.paused_since
+                music.paused_since = None
             button.label = "Pause"
             button.emoji = "⏸️"
             await interaction.response.edit_message(view=self)
@@ -440,7 +545,7 @@ class MusicView(discord.ui.View):
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Skip", emoji="⏭️", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Skip", emoji="⏭️", style=discord.ButtonStyle.secondary, row=0)
     async def skip_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         vc = interaction.guild.voice_client
 
@@ -457,10 +562,13 @@ class MusicView(discord.ui.View):
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Stop", emoji="⏹️", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Stop", emoji="⏹️", style=discord.ButtonStyle.danger, row=0)
     async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         music = get_music(self.guild_id)
         music.queue.clear()
+
+        if music.update_task and not music.update_task.done():
+            music.update_task.cancel()
 
         vc = interaction.guild.voice_client
 
@@ -479,11 +587,76 @@ class MusicView(discord.ui.View):
         music.current = None
         music.playing = False
         music.starting_song = False
+        music.now_playing_message = None
 
         await interaction.response.send_message(
             "⏹️ Musik gestoppt und Queue geleert.",
             ephemeral=True,
         )
+
+    @discord.ui.button(label="Like", emoji="🤍", style=discord.ButtonStyle.secondary, row=0)
+    async def like_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        music = get_music(self.guild_id)
+
+        if music.current is None:
+            await interaction.response.send_message(
+                "❌ Aktuell läuft kein Song.",
+                ephemeral=True,
+            )
+            return
+
+        title = music.current["title"]
+
+        if title in music.liked:
+            music.liked.discard(title)
+            button.emoji = "🤍"
+            message = f"💔 **{title}** aus den Likes entfernt."
+        else:
+            music.liked.add(title)
+            button.emoji = "❤️"
+            message = f"❤️ **{title}** geliked!"
+
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send(message, ephemeral=True)
+
+    # ---------- Reihe 2 ----------
+    @discord.ui.button(label="Leiser", emoji="🔉", style=discord.ButtonStyle.secondary, row=1)
+    async def volume_down_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        music = get_music(self.guild_id)
+        music.volume = max(0.0, round(music.volume - 0.1, 2))
+
+        vc = interaction.guild.voice_client
+        if vc is not None and isinstance(vc.source, discord.PCMVolumeTransformer):
+            vc.source.volume = music.volume
+
+        await interaction.response.send_message(
+            f"🔉 Lautstärke: **{int(music.volume * 100)}%**",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Lauter", emoji="🔊", style=discord.ButtonStyle.secondary, row=1)
+    async def volume_up_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        music = get_music(self.guild_id)
+        music.volume = min(2.0, round(music.volume + 0.1, 2))
+
+        vc = interaction.guild.voice_client
+        if vc is not None and isinstance(vc.source, discord.PCMVolumeTransformer):
+            vc.source.volume = music.volume
+
+        await interaction.response.send_message(
+            f"🔊 Lautstärke: **{int(music.volume * 100)}%**",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Repeat: Aus", emoji="🔁", style=discord.ButtonStyle.secondary, row=1)
+    async def repeat_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        music = get_music(self.guild_id)
+        music.repeat = not music.repeat
+        button.label = f"Repeat: {'An' if music.repeat else 'Aus'}"
+        button.style = (
+            discord.ButtonStyle.success if music.repeat else discord.ButtonStyle.secondary
+        )
+        await interaction.response.edit_message(view=self)
 
 
 # ============================================================
@@ -704,6 +877,9 @@ async def stop(interaction: discord.Interaction):
     music = get_music(interaction.guild.id)
     music.queue.clear()
 
+    if music.update_task and not music.update_task.done():
+        music.update_task.cancel()
+
     vc = interaction.guild.voice_client
 
     if vc:
@@ -721,6 +897,7 @@ async def stop(interaction: discord.Interaction):
     music.current = None
     music.playing = False
     music.starting_song = False
+    music.now_playing_message = None
 
     await interaction.response.send_message(
         "⏹️ Musik gestoppt und Queue geleert."
@@ -802,7 +979,9 @@ async def pause(interaction: discord.Interaction):
         await interaction.response.send_message("❌ Es läuft gerade kein Song.")
         return
 
+    music = get_music(interaction.guild.id)
     vc.pause()
+    music.paused_since = time.time()
     await interaction.response.send_message("⏸️ Musik pausiert.")
 
 
@@ -821,7 +1000,11 @@ async def resume(interaction: discord.Interaction):
         await interaction.response.send_message("❌ Die Musik ist nicht pausiert.")
         return
 
+    music = get_music(interaction.guild.id)
     vc.resume()
+    if music.paused_since:
+        music.paused_total += time.time() - music.paused_since
+        music.paused_since = None
     await interaction.response.send_message("▶️ Musik läuft weiter.")
 
 
