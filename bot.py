@@ -170,7 +170,8 @@ def get_music(guild_id):
 # Nötig, weil YouTube Anfragen von Rechenzentrums-IPs (Railway etc.) inzwischen
 # oft zusätzlich zu Cookies einen "Proof of Origin"-Token verlangt.
 # POT_PROVIDER_URL z.B. "http://bgutil-provider.railway.internal:4416"
-POT_PROVIDER_URL = os.getenv("POT_PROVIDER_URL")
+POT_PROVIDER_URL = os.getenv("POT_PROVIDER_URL") or os.getenv("YTDLP_POT_PROVIDER_URL")
+POT_PROVIDER_DISABLE_INNERTUBE = os.getenv("POT_PROVIDER_DISABLE_INNERTUBE", "0").lower() in {"1", "true", "yes", "on"}
 YTDLP_JS_RUNTIME = os.getenv("YTDLP_JS_RUNTIME")
 YTDLP_USER_AGENT = os.getenv(
     "YTDLP_USER_AGENT",
@@ -188,7 +189,9 @@ _BASE_YTDL_OPTIONS = {
     "geo_bypass": True,
     "extractor_args": {
         "youtube": {
-            "player_client": ["tv", "web", "android", "ios"],
+            # Aktuell ist web der wichtigste Client für den PO-Token-Provider.
+            # tv dient als Fallback für Videos, die über web nicht verfügbar sind.
+            "player_client": ["web", "tv"],
         }
     },
     "http_headers": {
@@ -197,10 +200,15 @@ _BASE_YTDL_OPTIONS = {
 }
 
 if POT_PROVIDER_URL:
-    _BASE_YTDL_OPTIONS["extractor_args"]["youtubepot-bgutilhttp"] = {
-        "base_url": [POT_PROVIDER_URL]
-    }
+    _pot_args = {"base_url": [POT_PROVIDER_URL]}
+    if POT_PROVIDER_DISABLE_INNERTUBE:
+        _pot_args["disable_innertube"] = ["1"]
+    _BASE_YTDL_OPTIONS["extractor_args"]["youtubepot-bgutilhttp"] = _pot_args
     print(f"yt-dlp: PO-Token-Provider konfiguriert ({POT_PROVIDER_URL}).")
+    if POT_PROVIDER_DISABLE_INNERTUBE:
+        print("yt-dlp: PO-Token-Provider Legacy-Modus aktiv (disable_innertube=1).")
+else:
+    print("WARNUNG: POT_PROVIDER_URL ist nicht gesetzt -> kein externer PO-Token-Provider.")
 
 if YTDLP_JS_RUNTIME:
     _BASE_YTDL_OPTIONS["js_runtimes"] = {YTDLP_JS_RUNTIME: {}}
@@ -215,6 +223,18 @@ if COOKIES_FILE and os.path.exists(COOKIES_FILE):
         f"yt-dlp: Cookie-Datei geladen ({COOKIES_FILE}, "
         f"{_cookie_size} Bytes, {len(_cookie_lines)} Cookie-Einträge)."
     )
+    try:
+        with open(COOKIES_FILE, "r", encoding="utf-8", errors="ignore") as _cf:
+            _cookie_header = _cf.readline().strip()
+    except Exception:
+        _cookie_header = ""
+
+    if not _cookie_header.startswith(("# HTTP Cookie File", "# Netscape HTTP Cookie File")):
+        print(
+            "WARNUNG: COOKIES_FILE ist vermutlich nicht im Netscape/Mozilla-Format. "
+            "Die erste Zeile sollte '# Netscape HTTP Cookie File' oder "
+            "'# HTTP Cookie File' sein."
+        )
     if _cookie_size < 500 or len(_cookie_lines) < 5:
         print(
             "WARNUNG: Cookie-Datei wirkt sehr klein/leer. "
@@ -758,7 +778,6 @@ class MusicView(discord.ui.View):
         await interaction.response.send_message(
             f"🔉 Lautstärke: **{int(music.volume * 100)}%**",
             ephemeral=True,
-            delete_after=5,
         )
 
     @discord.ui.button(label="Lauter", emoji="🔊", style=discord.ButtonStyle.secondary, row=1)
@@ -773,7 +792,6 @@ class MusicView(discord.ui.View):
         await interaction.response.send_message(
             f"🔊 Lautstärke: **{int(music.volume * 100)}%**",
             ephemeral=True,
-            delete_after=5,
         )
 
     @discord.ui.button(label="Repeat: Aus", emoji="🔁", style=discord.ButtonStyle.secondary, row=1)
@@ -1153,7 +1171,9 @@ async def on_ready():
     print(f"Auto-Disconnect: {AUTO_DISCONNECT_DELAY // 60} Minuten")
     print(f"YouTube-Cookies: {'AKTIV' if 'cookiefile' in _BASE_YTDL_OPTIONS else 'NICHT GESETZT'}")
     print(f"YouTube-PO-Token: {'AKTIV' if POT_PROVIDER_URL else 'NICHT GESETZT'}")
-    print(f"YouTube-JS-Runtime: {'AKTIV' if YTDLP_JS_RUNTIME else 'OPTIONAL / NICHT GESETZT'}")
+    print(f"YouTube-JS-Runtime: {'AKTIV' if YTDLP_JS_RUNTIME else 'STANDARD / NICHT EXPLIZIT GESETZT'}")
+    if POT_PROVIDER_URL:
+        print("YouTube-Setup: web + tv Client mit bgutil PO-Token-Provider")
     print("====================================")
 
     try:
