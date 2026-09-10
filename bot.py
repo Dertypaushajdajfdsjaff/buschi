@@ -172,7 +172,7 @@ def get_music(guild_id):
 # POT_PROVIDER_URL z.B. "http://bgutil-provider.railway.internal:4416"
 POT_PROVIDER_URL = os.getenv("POT_PROVIDER_URL") or os.getenv("YTDLP_POT_PROVIDER_URL")
 POT_PROVIDER_DISABLE_INNERTUBE = os.getenv("POT_PROVIDER_DISABLE_INNERTUBE", "0").lower() in {"1", "true", "yes", "on"}
-YTDLP_JS_RUNTIME = os.getenv("YTDLP_JS_RUNTIME")
+YTDLP_JS_RUNTIME = os.getenv("YTDLP_JS_RUNTIME", "deno")
 YTDLP_USER_AGENT = os.getenv(
     "YTDLP_USER_AGENT",
     (
@@ -189,9 +189,11 @@ _BASE_YTDL_OPTIONS = {
     "geo_bypass": True,
     "extractor_args": {
         "youtube": {
-            # Aktuell ist web der wichtigste Client für den PO-Token-Provider.
-            # tv dient als Fallback für Videos, die über web nicht verfügbar sind.
-            "player_client": ["web", "tv"],
+            # yt-dlp empfiehlt aktuell, den PO-Token-Provider den mweb-Client
+            # für GVS-Requests versorgen zu lassen. web dient als Fallback.
+            # (web allein braucht zusätzlich einen separaten Player-Token,
+            # tv unterstützt Cookie-Login kaum noch zuverlässig.)
+            "player_client": ["mweb", "web"],
         }
     },
     "http_headers": {
