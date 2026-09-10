@@ -573,17 +573,18 @@ async def play(
 
         result = await search_youtube(song)
 
-    except Exception as error:
+except Exception as error:
 
-        print(
-            f"YouTube-Suchfehler: {error}"
-        )
+    print("====================================")
+    print("YOUTUBE FEHLER:")
+    print(repr(error))
+    print("====================================")
 
-        await interaction.followup.send(
-            "❌ Bei der YouTube-Suche ist ein Fehler aufgetreten."
-        )
+    await interaction.followup.send(
+        f"❌ YouTube-Fehler:\n```{str(error)[:1800]}```"
+    )
 
-        return
+    return
 
     if result is None:
 
