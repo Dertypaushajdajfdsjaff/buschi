@@ -1,4 +1,3 @@
-```python
 import os
 import time
 import asyncio
@@ -921,4 +920,3 @@ async def on_ready():
 # ============================================================
 
 bot.run(TOKEN)
-```
