@@ -23,4 +23,6 @@ RUN pip install --no-cache-dir --upgrade pip \
 COPY bot.py .
 COPY cookies.txt .
 
-CMD ["python", "bot.py"]
+ENV PYTHONUNBUFFERED=1
+
+CMD ["python", "-u", "bot.py"]
