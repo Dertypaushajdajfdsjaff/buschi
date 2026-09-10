@@ -1,6 +1,7 @@
 import os
 import time
 import asyncio
+import traceback
 from collections import deque
 from datetime import datetime
 
@@ -22,6 +23,13 @@ if not TOKEN:
         "DISCORD_TOKEN wurde nicht gefunden. "
         "Lege die Variable in Railway an."
     )
+
+# Optionaler Pfad zu einer cookies.txt (Netscape-Format), exportiert aus
+# einem eingeloggten YouTube-Account. Hilft massiv gegen
+# "Sign in to confirm you're not a bot" auf Cloud-IPs wie Railway.
+# In Railway als Variable COOKIES_FILE setzen (z.B. "/app/cookies.txt")
+# und die Datei per Volume/Secret bereitstellen.
+COOKIES_FILE = os.getenv("COOKIES_FILE")
 
 # ============================================================
 # EINSTELLUNGEN
@@ -141,19 +149,44 @@ def get_music(guild_id):
 # ============================================================
 # YOUTUBE / YT-DLP
 # ============================================================
-YTDL_SEARCH_OPTIONS = {
+# extractor_args mit "android"-Client + Cookie-Unterstützung reduzieren das
+# Risiko von "Sign in to confirm you're not a bot" auf Cloud-IPs deutlich.
+# 100%ig sicher ist es nicht, aber es ist aktuell der zuverlässigste
+# Workaround ohne eigenen Proxy.
+_BASE_YTDL_OPTIONS = {
     "quiet": True,
     "no_warnings": True,
-    "default_search": "ytsearch",
     "noplaylist": True,
+    "geo_bypass": True,
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android", "web"],
+        }
+    },
+    "http_headers": {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
+    },
+}
+
+if COOKIES_FILE and os.path.exists(COOKIES_FILE):
+    _BASE_YTDL_OPTIONS["cookiefile"] = COOKIES_FILE
+    print(f"yt-dlp: Cookie-Datei geladen ({COOKIES_FILE}).")
+elif COOKIES_FILE:
+    print(f"WARNUNG: COOKIES_FILE gesetzt, aber Datei nicht gefunden: {COOKIES_FILE}")
+
+YTDL_SEARCH_OPTIONS = {
+    **_BASE_YTDL_OPTIONS,
+    "default_search": "ytsearch",
     "extract_flat": True,
 }
 
 YTDL_AUDIO_OPTIONS = {
+    **_BASE_YTDL_OPTIONS,
     "format": "bestaudio/best",
-    "quiet": True,
-    "no_warnings": True,
-    "noplaylist": True,
 }
 
 FFMPEG_OPTIONS = {
@@ -165,10 +198,31 @@ FFMPEG_OPTIONS = {
     "options": "-vn",
 }
 
+YTDL_MAX_RETRIES = 3
+YTDL_RETRY_DELAY = 2  # Sekunden
+
+
+async def _run_with_retries(func, *, retries=YTDL_MAX_RETRIES, timeout=30, label="yt-dlp"):
+    """Führt eine blockierende yt-dlp Funktion im Executor aus, mit Retries."""
+    loop = asyncio.get_running_loop()
+    last_error = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            return await asyncio.wait_for(
+                loop.run_in_executor(None, func),
+                timeout=timeout,
+            )
+        except Exception as error:
+            last_error = error
+            print(f"[{label}] Versuch {attempt}/{retries} fehlgeschlagen: {repr(error)}")
+            if attempt < retries:
+                await asyncio.sleep(YTDL_RETRY_DELAY)
+
+    raise last_error
+
 
 async def search_youtube(query):
-    loop = asyncio.get_running_loop()
-
     def search():
         with yt_dlp.YoutubeDL(YTDL_SEARCH_OPTIONS) as ydl:
             info = ydl.extract_info(
@@ -181,15 +235,10 @@ async def search_youtube(query):
 
             return info["entries"][0]
 
-    return await asyncio.wait_for(
-        loop.run_in_executor(None, search),
-        timeout=30,
-    )
+    return await _run_with_retries(search, timeout=30, label="Suche")
 
 
 async def get_audio_url(webpage_url):
-    loop = asyncio.get_running_loop()
-
     def extract():
         with yt_dlp.YoutubeDL(YTDL_AUDIO_OPTIONS) as ydl:
             info = ydl.extract_info(webpage_url, download=False)
@@ -202,10 +251,7 @@ async def get_audio_url(webpage_url):
                 "duration": info.get("duration"),
             }
 
-    return await asyncio.wait_for(
-        loop.run_in_executor(None, extract),
-        timeout=45,
-    )
+    return await _run_with_retries(extract, timeout=45, label="Audio-Extraktion")
 
 
 # ============================================================
@@ -298,7 +344,17 @@ async def play_next(guild):
         print("FEHLER BEIM ABSPIELEN:")
         print(f"Typ: {type(error).__name__}")
         print(f"Fehler: {repr(error)}")
+        traceback.print_exc()
         print("====================================")
+
+        if music.text_channel:
+            try:
+                await music.text_channel.send(
+                    f"❌ Fehler beim Abspielen von **{song['title']}**:\n"
+                    f"```{str(error)[:1500]}```"
+                )
+            except Exception:
+                pass
 
         # Nächsten Song versuchen, falls einer in der Queue ist.
         if music.queue:
@@ -401,6 +457,61 @@ class MusicView(discord.ui.View):
 
 
 # ============================================================
+# VOICE JOIN HELFER (mit Retries)
+# ============================================================
+async def connect_voice(interaction, voice_channel, retries=2):
+    """Verbindet mit einem Voice-Channel und gibt (vc, error) zurück.
+    Bei RuntimeError/Timeout wird ein zweiter Versuch gemacht, da das oft
+    an einem einmaligen UDP-Handshake-Hänger liegt."""
+    last_error = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            vc = interaction.guild.voice_client
+
+            if vc is not None and not vc.is_connected():
+                print("Alter Voice-Client gefunden -> trenne ihn.")
+                try:
+                    await vc.disconnect(force=True)
+                except Exception:
+                    pass
+                vc = None
+
+            if vc is None:
+                print(f"Verbinde mit Voice-Channel: {voice_channel.name} (Versuch {attempt}/{retries})")
+                vc = await asyncio.wait_for(
+                    voice_channel.connect(reconnect=True, self_deaf=True),
+                    timeout=20,
+                )
+            elif vc.channel != voice_channel:
+                print(f"Wechsle Voice-Channel nach: {voice_channel.name}")
+                await asyncio.wait_for(
+                    vc.move_to(voice_channel),
+                    timeout=20,
+                )
+
+            return vc, None
+
+        except Exception as error:
+            last_error = error
+            print(f"Voice-Connect Versuch {attempt}/{retries} fehlgeschlagen: {type(error).__name__}: {repr(error)}")
+            traceback.print_exc()
+
+            # Hängenden Client vor dem nächsten Versuch aufräumen.
+            try:
+                stale_vc = interaction.guild.voice_client
+                if stale_vc is not None:
+                    await stale_vc.disconnect(force=True)
+            except Exception:
+                pass
+
+            if attempt < retries:
+                await asyncio.sleep(2)
+
+    return None, last_error
+
+
+# ============================================================
 # /PLAY
 # ============================================================
 @bot.tree.command(name="play", description="Spielt einen Song von YouTube ab.")
@@ -431,7 +542,7 @@ async def play(interaction: discord.Interaction, song: str):
     try:
         result = await search_youtube(song)
     except asyncio.TimeoutError:
-        print("YouTube-Suche Timeout")
+        print("YouTube-Suche Timeout (alle Versuche)")
         await interaction.followup.send(
             "❌ Die YouTube-Suche hat zu lange gedauert. Bitte versuche es erneut."
         )
@@ -441,10 +552,22 @@ async def play(interaction: discord.Interaction, song: str):
         print("YOUTUBE FEHLER:")
         print(f"Typ: {type(error).__name__}")
         print(f"Fehler: {repr(error)}")
+        traceback.print_exc()
         print("====================================")
-        await interaction.followup.send(
-            f"❌ YouTube-Fehler:\n```{str(error)[:1800]}```"
-        )
+
+        fehlertext = str(error)
+        if "Sign in to confirm" in fehlertext or "bot" in fehlertext.lower():
+            await interaction.followup.send(
+                "❌ YouTube blockiert die Suche von diesem Server aus "
+                "(\"Sign in to confirm you're not a bot\"). Das ist ein "
+                "bekanntes Problem bei Cloud-Hostern wie Railway. Siehe "
+                "Railway-Logs für Details – ggf. wird ein Cookie-Login "
+                "(COOKIES_FILE) benötigt."
+            )
+        else:
+            await interaction.followup.send(
+                f"❌ YouTube-Fehler:\n```{fehlertext[:1800]}```"
+            )
         return
 
     if result is None:
@@ -469,89 +592,38 @@ async def play(interaction: discord.Interaction, song: str):
     # ========================================================
     # VOICE JOIN / RECONNECT
     # ========================================================
-    try:
-        vc = interaction.guild.voice_client
+    vc, voice_error = await connect_voice(interaction, voice_channel)
 
-        if vc is not None and not vc.is_connected():
-            print("Alter Voice-Client gefunden -> trenne ihn.")
-            try:
-                await vc.disconnect(force=True)
-            except Exception:
-                pass
-            vc = None
+    if voice_error is not None:
+        error = voice_error
 
-        if vc is None:
-            print(f"Verbinde mit Voice-Channel: {voice_channel.name}")
-            vc = await asyncio.wait_for(
-                voice_channel.connect(reconnect=True),
-                timeout=20,
+        if isinstance(error, discord.Forbidden):
+            await interaction.followup.send(
+                "❌ Ich darf diesem Voice-Channel nicht beitreten. "
+                "Prüfe die Rechte **Kanal ansehen**, **Verbinden** und **Sprechen**."
             )
-        elif vc.channel != voice_channel:
-            print(f"Wechsle Voice-Channel nach: {voice_channel.name}")
-            await asyncio.wait_for(
-                vc.move_to(voice_channel),
-                timeout=20,
+        elif isinstance(error, asyncio.TimeoutError):
+            await interaction.followup.send(
+                "❌ Der Voice-Connect hat mehrfach zu lange gedauert.\n"
+                "Das deutet stark auf ein **UDP-Blocking** durch den Hoster "
+                "(z.B. Railway) hin – der Websocket-Teil klappt, aber der "
+                "eigentliche Audio-Handshake (UDP) nicht. Prüfe die Railway-"
+                "Netzwerkeinstellungen oder wechsle zu einem Hoster mit "
+                "offenem UDP-Traffic."
             )
-
-        music.voice_client = vc
-
-    except discord.Forbidden as error:
-        print("====================================")
-        print("VOICE FEHLER: FORBIDDEN")
-        print(repr(error))
-        print("====================================")
-        await interaction.followup.send(
-            "❌ Ich darf diesem Voice-Channel nicht beitreten. "
-            "Prüfe die Rechte **Kanal ansehen**, **Verbinden** und **Sprechen**."
-        )
+        elif isinstance(error, discord.ClientException):
+            await interaction.followup.send(
+                "❌ Discord hat die Voice-Verbindung abgelehnt. "
+                "Details wurden in Railway protokolliert."
+            )
+        else:
+            await interaction.followup.send(
+                "❌ Ich konnte dem Voice-Channel nicht beitreten.\n"
+                f"Fehler: `{type(error).__name__}: {str(error)[:300]}`"
+            )
         return
 
-    except asyncio.TimeoutError as error:
-        print("====================================")
-        print("VOICE FEHLER: TIMEOUT")
-        print(repr(error))
-        print("====================================")
-        await interaction.followup.send(
-            "❌ Der Voice-Connect hat zu lange gedauert. Bitte versuche `/play` noch einmal."
-        )
-        return
-
-    except RuntimeError as error:
-        print("====================================")
-        print("VOICE FEHLER: RUNTIMEERROR")
-        print(f"Typ: {type(error).__name__}")
-        print(f"Fehler: {repr(error)}")
-        print("====================================")
-
-        await interaction.followup.send(
-            "❌ Voice konnte nicht gestartet werden.\n"
-            f"Details: `{str(error)[:500]}`"
-        )
-        return
-
-    except discord.ClientException as error:
-        print("====================================")
-        print("VOICE FEHLER: CLIENTEXCEPTION")
-        print(f"Typ: {type(error).__name__}")
-        print(f"Fehler: {repr(error)}")
-        print("====================================")
-        await interaction.followup.send(
-            "❌ Discord hat die Voice-Verbindung abgelehnt. "
-            "Ich habe den Fehler in Railway protokolliert."
-        )
-        return
-
-    except Exception as error:
-        print("====================================")
-        print("VOICE FEHLER:")
-        print(f"Typ: {type(error).__name__}")
-        print(f"Fehler: {repr(error)}")
-        print("====================================")
-        await interaction.followup.send(
-            "❌ Ich konnte dem Voice-Channel nicht beitreten.\n"
-            f"Fehler: `{type(error).__name__}`"
-        )
-        return
+    music.voice_client = vc
 
     # ========================================================
     # SONG IN QUEUE
