@@ -3,6 +3,7 @@ import time
 import asyncio
 import traceback
 import copy
+import subprocess
 from collections import deque
 from datetime import datetime
 
@@ -147,6 +148,7 @@ class GuildMusic:
         self.paused_total = 0.0
         self.update_task = None
         self.disconnect_task = None
+        self.ytdlp_process = None  # externer yt-dlp-Prozess, der Audiodaten an ffmpeg pipet
 
 
 guild_music = {}
@@ -172,7 +174,7 @@ def get_music(guild_id):
 # POT_PROVIDER_URL z.B. "http://bgutil-provider.railway.internal:4416"
 POT_PROVIDER_URL = os.getenv("POT_PROVIDER_URL") or os.getenv("YTDLP_POT_PROVIDER_URL")
 POT_PROVIDER_DISABLE_INNERTUBE = os.getenv("POT_PROVIDER_DISABLE_INNERTUBE", "0").lower() in {"1", "true", "yes", "on"}
-YTDLP_JS_RUNTIME = os.getenv("YTDLP_JS_RUNTIME")
+YTDLP_JS_RUNTIME = os.getenv("YTDLP_JS_RUNTIME", "deno")
 YTDLP_USER_AGENT = os.getenv(
     "YTDLP_USER_AGENT",
     (
@@ -189,9 +191,13 @@ _BASE_YTDL_OPTIONS = {
     "geo_bypass": True,
     "extractor_args": {
         "youtube": {
-            # Aktuell ist web der wichtigste Client für den PO-Token-Provider.
-            # tv dient als Fallback für Videos, die über web nicht verfügbar sind.
-            "player_client": ["web", "tv"],
+            # mweb ist der aktuell von yt-dlp empfohlene Client für den
+            # PO-Token-Provider (GVS-Requests). "web" bewusst NICHT als
+            # Fallback: web braucht zusätzlich einen separaten "Player"-
+            # PO-Token (den unser Provider nicht liefert) - fällt yt-dlp bei
+            # fehlendem mweb-Format auf ein web-Format zurück, gibt es ein
+            # 403. tv als Fallback braucht i.d.R. keinen PO-Token.
+            "player_client": ["mweb", "tv"],
         }
     },
     "http_headers": {
@@ -244,6 +250,15 @@ elif COOKIES_FILE:
     print(f"WARNUNG: COOKIES_FILE gesetzt, aber Datei nicht gefunden: {COOKIES_FILE}")
 else:
     print("WARNUNG: COOKIES_FILE ist nicht gesetzt -> yt-dlp läuft ohne Cookies.")
+
+# Optional: YTDLP_DEBUG=1 in Railway setzen, um bei Bot-Blocks die vollen
+# yt-dlp-Debug-Infos (genutzter Client, PO-Token-Status, Cookie-Nutzung) im
+# Log zu sehen. Für den Normalbetrieb aus, da es die Logs sehr voll macht.
+if os.getenv("YTDLP_DEBUG", "0").lower() in {"1", "true", "yes", "on"}:
+    _BASE_YTDL_OPTIONS["quiet"] = False
+    _BASE_YTDL_OPTIONS["no_warnings"] = False
+    _BASE_YTDL_OPTIONS["verbose"] = True
+    print("yt-dlp: Debug-Modus AKTIV (YTDLP_DEBUG=1).")
 
 YTDL_SEARCH_OPTIONS = copy.deepcopy(_BASE_YTDL_OPTIONS)
 YTDL_SEARCH_OPTIONS.update({
@@ -302,6 +317,7 @@ async def _run_with_retries(func, *, retries=YTDL_MAX_RETRIES, timeout=30, label
                     f"[{label}] YouTube blockiert die Anfrage: "
                     "Sign in / bot verification erforderlich."
                 )
+                print(f"[{label}] Rohe yt-dlp-Fehlermeldung: {message}")
                 raise
 
             print(
@@ -335,15 +351,101 @@ async def get_audio_url(webpage_url):
         with yt_dlp.YoutubeDL(YTDL_AUDIO_OPTIONS) as ydl:
             info = ydl.extract_info(webpage_url, download=False)
 
+            # yt-dlp hängt an info["url"] eine googlevideo.com-Adresse, die an
+            # den PO-Token/Client-Kontext gebunden ist. Ohne die exakt
+            # gleichen Request-Header (v.a. User-Agent) lehnt YouTubes CDN
+            # den Zugriff durch ffmpeg mit 403 Forbidden ab.
             return {
                 "url": info["url"],
                 "title": info.get("title", "Unbekannter Song"),
                 "webpage_url": info.get("webpage_url", webpage_url),
                 "thumbnail": info.get("thumbnail"),
                 "duration": info.get("duration"),
+                "http_headers": info.get("http_headers") or {},
             }
 
     return await _run_with_retries(extract, timeout=45, label="Audio-Extraktion")
+
+
+def build_ytdlp_cli_args(webpage_url):
+    """CLI-Argumente für den externen yt-dlp-Prozess, passend zu den
+    Python-API-Optionen (_BASE_YTDL_OPTIONS), die auch für die Metadaten-
+    Extraktion verwendet werden."""
+    args = [
+        "yt-dlp",
+        "-f", YTDL_AUDIO_OPTIONS["format"],
+        "-o", "-",
+        "--no-playlist",
+        "--geo-bypass",
+        "--quiet",
+        "--no-warnings",
+        "--user-agent", YTDLP_USER_AGENT,
+    ]
+
+    player_clients = ",".join(
+        _BASE_YTDL_OPTIONS["extractor_args"]["youtube"]["player_client"]
+    )
+    args += ["--extractor-args", f"youtube:player_client={player_clients}"]
+
+    if POT_PROVIDER_URL:
+        pot_arg = f"youtubepot-bgutilhttp:base_url={POT_PROVIDER_URL}"
+        if POT_PROVIDER_DISABLE_INNERTUBE:
+            pot_arg += ";disable_innertube=1"
+        args += ["--extractor-args", pot_arg]
+
+    if YTDLP_JS_RUNTIME:
+        args += ["--js-runtimes", YTDLP_JS_RUNTIME]
+
+    if COOKIES_FILE and os.path.exists(COOKIES_FILE):
+        args += ["--cookies", COOKIES_FILE]
+
+    args.append(webpage_url)
+    return args
+
+
+def start_ytdlp_stream(webpage_url):
+    """Startet yt-dlp als eigenen Prozess, der die Audiodaten direkt an
+    stdout streamt (statt ffmpeg die googlevideo.com-URL selbst abrufen zu
+    lassen). Dadurch läuft der komplette YouTube-Request - inkl. Cookies,
+    PO-Token und Headern - über yt-dlp's eigene, dafür konfigurierte
+    HTTP-Session. Vermeidet 403 Forbidden durch abweichende Request-Header
+    oder Verbindungspfade zwischen Extraktion und Wiedergabe."""
+    args = build_ytdlp_cli_args(webpage_url)
+    return subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def stop_ytdlp_process(music):
+    proc = music.ytdlp_process
+    music.ytdlp_process = None
+    if proc and proc.poll() is None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+
+def build_ffmpeg_options(http_headers):
+    """Baut pro Song passende ffmpeg-Optionen inkl. der Request-Header, mit
+    denen yt-dlp die Stream-URL geholt hat. Fehlen die, liefert YouTubes CDN
+    für die googlevideo.com-URL oft ein 403 Forbidden."""
+    headers = dict(http_headers or {})
+    headers.setdefault("User-Agent", YTDLP_USER_AGENT)
+
+    header_block = "".join(f"{key}: {value}\r\n" for key, value in headers.items())
+
+    return {
+        "before_options": (
+            "-reconnect 1 "
+            "-reconnect_streamed 1 "
+            "-reconnect_delay_max 5 "
+            f'-headers "{header_block}"'
+        ),
+        "options": "-vn",
+    }
 
 
 def is_youtube_bot_block(error):
@@ -496,7 +598,7 @@ async def auto_disconnect_after_idle(guild):
 # ============================================================
 # SONG ABSPIELEN
 # ============================================================
-async def play_next(guild, preloaded_audio=None):
+async def play_next(guild):
     music = get_music(guild.id)
 
     if music.voice_client is None or not music.voice_client.is_connected():
@@ -521,7 +623,7 @@ async def play_next(guild, preloaded_audio=None):
     cancel_disconnect_timer(music)
 
     try:
-        audio = preloaded_audio if preloaded_audio is not None else await get_audio_url(song["webpage_url"])
+        audio = await get_audio_url(song["webpage_url"])
 
         if audio.get("duration"):
             song["duration"] = audio["duration"]
@@ -529,13 +631,22 @@ async def play_next(guild, preloaded_audio=None):
         if music.voice_client is None or not music.voice_client.is_connected():
             raise RuntimeError("Der Voice-Client ist nicht mehr verbunden.")
 
+        # Alten Pipe-Prozess (falls noch einer läuft) beenden, bevor ein
+        # neuer gestartet wird.
+        stop_ytdlp_process(music)
+
+        proc = start_ytdlp_stream(song["webpage_url"])
+        music.ytdlp_process = proc
+
         raw_source = discord.FFmpegPCMAudio(
-            audio["url"],
-            **FFMPEG_OPTIONS,
+            proc.stdout,
+            pipe=True,
+            options="-vn",
         )
         source = discord.PCMVolumeTransformer(raw_source, volume=music.volume)
 
         def after_play(error):
+            stop_ytdlp_process(music)
             if error:
                 print(f"Audio-Fehler bei '{song['title']}': {repr(error)}")
             try:
@@ -560,7 +671,7 @@ async def play_next(guild, preloaded_audio=None):
             embed = create_music_embed(music, music.voice_client.channel.name)
             music.now_playing_message = await music.text_channel.send(
                 embed=embed,
-                view=MusicView(guild.id, delete_enabled=False),
+                view=MusicView(guild.id),
             )
             music.update_task = asyncio.create_task(now_playing_updater(guild.id))
 
@@ -569,12 +680,14 @@ async def play_next(guild, preloaded_audio=None):
     except Exception as error:
         music.playing = False
         music.current = None
+        stop_ytdlp_process(music)
 
         if is_youtube_bot_block(error):
             print(
                 f"YouTube-Bot-Block bei '{song['title']}'. "
                 "COOKIES_FILE/PO-Token/JS-Runtime prüfen."
             )
+            print(f"Rohe yt-dlp-Fehlermeldung: {error}")
             error_message = (
                 f"❌ YouTube blockiert **{song['title']}** auf dem Railway-Server.\n"
                 "Bitte aktuelle YouTube-Cookies über `COOKIES_FILE` bereitstellen "
@@ -611,23 +724,14 @@ async def play_next(guild, preloaded_audio=None):
 async def song_finished(guild):
     music = get_music(guild.id)
     finished_song = music.current
-    finished_message = music.now_playing_message
     music.playing = False
     music.current = None
-
-    # Das alte Now-Playing-Panel gehört jetzt zu einem beendeten Song.
-    # Deshalb wird nur dort der Delete-Button freigeschaltet.
-    if finished_message is not None:
-        try:
-            await finished_message.edit(view=MusicView(guild.id, delete_enabled=True))
-        except Exception as error:
-            print(f"Konnte Delete-Button nach Songende nicht aktivieren: {repr(error)}")
 
     # Bei aktivem Repeat den gerade beendeten Song vorne wieder einreihen.
     if music.repeat and finished_song:
         music.queue.appendleft(finished_song)
 
-    await asyncio.sleep(0.15)
+    await asyncio.sleep(0.5)
     await play_next(guild)
 
 
@@ -635,21 +739,9 @@ async def song_finished(guild):
 # MUSIC BUTTONS
 # ============================================================
 class MusicView(discord.ui.View):
-    def __init__(self, guild_id, delete_enabled=False):
+    def __init__(self, guild_id):
         super().__init__(timeout=None)
         self.guild_id = guild_id
-        self.delete_enabled = delete_enabled
-
-        # Der Button ist erst aktiv, wenn der Song vorbei oder gestoppt wurde.
-        self.delete_button.disabled = not delete_enabled
-
-    async def enable_delete_button(self):
-        self.delete_enabled = True
-        self.delete_button.disabled = False
-
-    async def disable_delete_button(self):
-        self.delete_enabled = False
-        self.delete_button.disabled = True
 
     # ---------- Reihe 1 ----------
     @discord.ui.button(label="Zurück", emoji="⏮️", style=discord.ButtonStyle.secondary, row=0)
@@ -728,7 +820,6 @@ class MusicView(discord.ui.View):
     @discord.ui.button(label="Stop", emoji="⏹️", style=discord.ButtonStyle.danger, row=0)
     async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         music = get_music(self.guild_id)
-        stopped_message = interaction.message
         music.queue.clear()
 
         if music.update_task and not music.update_task.done():
@@ -756,12 +847,6 @@ class MusicView(discord.ui.View):
         music.playing = False
         music.starting_song = False
         music.now_playing_message = None
-
-        # Das gestoppte Panel darf anschließend gelöscht werden.
-        try:
-            await stopped_message.edit(view=MusicView(self.guild_id, delete_enabled=True))
-        except Exception as error:
-            print(f"Konnte Delete-Button nach Stop nicht aktivieren: {repr(error)}")
 
         await interaction.response.send_message(
             "⏹️ Musik gestoppt und Queue geleert.",
@@ -806,7 +891,7 @@ class MusicView(discord.ui.View):
         await interaction.response.send_message(
             f"🔉 Lautstärke: **{int(music.volume * 100)}%**",
             ephemeral=True,
-            delete_after=5,
+            delete_after=3,
         )
 
     @discord.ui.button(label="Lauter", emoji="🔊", style=discord.ButtonStyle.secondary, row=1)
@@ -821,7 +906,7 @@ class MusicView(discord.ui.View):
         await interaction.response.send_message(
             f"🔊 Lautstärke: **{int(music.volume * 100)}%**",
             ephemeral=True,
-            delete_after=5,
+            delete_after=3,
         )
 
     @discord.ui.button(label="Repeat: Aus", emoji="🔁", style=discord.ButtonStyle.secondary, row=1)
@@ -833,34 +918,6 @@ class MusicView(discord.ui.View):
             discord.ButtonStyle.success if music.repeat else discord.ButtonStyle.secondary
         )
         await interaction.response.edit_message(view=self)
-
-    @discord.ui.button(
-        label="Delete this message",
-        emoji="🗑️",
-        style=discord.ButtonStyle.danger,
-        row=2,
-        disabled=True,
-    )
-    async def delete_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Sicherheitsprüfung: Während Musik läuft darf der Button niemals löschen.
-        music = get_music(self.guild_id)
-        vc = interaction.guild.voice_client if interaction.guild else None
-        if music.playing or music.starting_song or (vc is not None and (vc.is_playing() or vc.is_paused())):
-            await interaction.response.send_message(
-                "⛔ Du kannst diese Nachricht erst löschen, wenn der Song vorbei oder gestoppt wurde.",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.send_message(
-            "🗑️ Nachricht wird in **3 Sekunden** gelöscht.",
-            ephemeral=True,
-        )
-        await asyncio.sleep(3)
-        try:
-            await interaction.message.delete()
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            pass
 
 
 # ============================================================
@@ -918,26 +975,6 @@ async def connect_voice(interaction, voice_channel, retries=2):
     return None, last_error
 
 
-async def _wait_play_start_tasks(audio_task, voice_task):
-    """Wartet parallel auf Audio-Extraktion und Voice-Connect.
-
-    Fehler eines Tasks werden sauber abgefangen, damit der andere Task
-    nicht als "Task exception was never retrieved" im Railway-Log landet.
-    """
-    results = await asyncio.gather(audio_task, voice_task, return_exceptions=True)
-    audio_result = results[0]
-    voice_result = results[1]
-
-    audio_error = audio_result if isinstance(audio_result, Exception) else None
-    if audio_error is not None:
-        audio_result = None
-
-    if isinstance(voice_result, Exception):
-        return audio_result, audio_error, None
-
-    return audio_result, audio_error, voice_result
-
-
 # ============================================================
 # /PLAY
 # ============================================================
@@ -967,29 +1004,10 @@ async def play(interaction: discord.Interaction, song: str):
     cancel_disconnect_timer(music)
 
     # ========================================================
-    # SONG SUCHEN / LINK DIREKT VERWENDEN
+    # SONG SUCHEN
     # ========================================================
-    # Bei einem direkten YouTube-Link sparen wir die zusätzliche Suchanfrage.
-    # Das entfernt einen unnötigen Teil des Start-Delays.
-    youtube_url = song.strip() if song.strip().startswith((
-        "https://www.youtube.com/",
-        "http://www.youtube.com/",
-        "https://youtu.be/",
-        "http://youtu.be/",
-        "https://music.youtube.com/",
-        "http://music.youtube.com/",
-    )) else None
-
     try:
-        if youtube_url:
-            result = {
-                "title": "YouTube Song",
-                "webpage_url": youtube_url,
-                "thumbnail": None,
-                "duration": None,
-            }
-        else:
-            result = await search_youtube(song)
+        result = await search_youtube(song)
     except asyncio.TimeoutError:
         print("YouTube-Suche Timeout (alle Versuche)")
         await interaction.followup.send(
@@ -1039,44 +1057,9 @@ async def play(interaction: discord.Interaction, song: str):
     }
 
     # ========================================================
-    # VOICE JOIN + AUDIO-EXTRAKTION PARALLEL
+    # VOICE JOIN / RECONNECT
     # ========================================================
-    # Bisher wurde erst Voice verbunden und danach die Audio-URL extrahiert.
-    # Beides dauert jeweils ein paar Sekunden. Jetzt laufen die beiden Schritte
-    # gleichzeitig, sodass sich der Start deutlich weniger verzögert.
-    audio_task = asyncio.create_task(get_audio_url(song_data["webpage_url"]))
-    voice_task = asyncio.create_task(connect_voice(interaction, voice_channel))
-
-    audio_result = None
-    audio_error = None
-    voice_result = None
-    voice_error = None
-
-    audio_result, audio_error, voice_result = await _wait_play_start_tasks(
-        audio_task, voice_task
-    )
-    if voice_result is not None:
-        vc, voice_error = voice_result
-    else:
-        vc, voice_error = None, RuntimeError("Voice-Connect ohne Ergebnis")
-
-    if audio_error is not None:
-        if is_youtube_bot_block(audio_error):
-            await interaction.followup.send(
-                "❌ YouTube blockiert diesen Song auf dem Railway-Server. "
-                "Bitte COOKIES_FILE und PO-Token-Provider prüfen."
-            )
-        else:
-            await interaction.followup.send(
-                f"❌ **{song_data['title']}** konnte nicht vorbereitet werden. "
-                f"`{type(audio_error).__name__}`"
-            )
-        if vc is not None and vc.is_connected():
-            try:
-                await vc.disconnect()
-            except Exception:
-                pass
-        return
+    vc, voice_error = await connect_voice(interaction, voice_channel)
 
     if voice_error is not None:
         error = voice_error
@@ -1118,7 +1101,7 @@ async def play(interaction: discord.Interaction, song: str):
         await interaction.followup.send(
             f"🎵 **{song_data['title']}** wird abgespielt."
         )
-        await play_next(interaction.guild, preloaded_audio=audio_result)
+        await play_next(interaction.guild)
     else:
         position = len(music.queue)
         await interaction.followup.send(
@@ -1156,8 +1139,8 @@ async def stop(interaction: discord.Interaction):
         return
 
     music = get_music(interaction.guild.id)
-    stopped_message = music.now_playing_message
     music.queue.clear()
+    stop_ytdlp_process(music)
 
     if music.update_task and not music.update_task.done():
         music.update_task.cancel()
@@ -1182,12 +1165,6 @@ async def stop(interaction: discord.Interaction):
     music.playing = False
     music.starting_song = False
     music.now_playing_message = None
-
-    if stopped_message is not None:
-        try:
-            await stopped_message.edit(view=MusicView(interaction.guild.id, delete_enabled=True))
-        except Exception as error:
-            print(f"Konnte Delete-Button nach /stop nicht aktivieren: {repr(error)}")
 
     await interaction.response.send_message(
         "⏹️ Musik gestoppt und Queue geleert."
