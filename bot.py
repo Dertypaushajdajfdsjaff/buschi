@@ -428,6 +428,22 @@ def stop_ytdlp_process(music):
             pass
 
 
+async def set_voice_status(voice_channel, text):
+    """Setzt den Discord-Voice-Channel-Status (das kleine Textfeld unter dem
+    Kanalnamen in der Kanalliste). Braucht die Berechtigung 'Kanäle verwalten'."""
+    if voice_channel is None:
+        return
+    try:
+        await voice_channel.edit(status=text)
+    except discord.Forbidden:
+        print(
+            "WARNUNG: Kein Recht 'Kanäle verwalten' -> Voice-Status "
+            "konnte nicht gesetzt werden."
+        )
+    except Exception as error:
+        print(f"Fehler beim Setzen des Voice-Status: {repr(error)}")
+
+
 def build_ffmpeg_options(http_headers):
     """Baut pro Song passende ffmpeg-Optionen inkl. der Request-Header, mit
     denen yt-dlp die Stream-URL geholt hat. Fehlen die, liefert YouTubes CDN
@@ -614,6 +630,8 @@ async def play_next(guild):
         music.playing = False
         music.current = None
         print(f"Queue von {guild.name} ist leer.")
+        if music.voice_client is not None:
+            await set_voice_status(music.voice_client.channel, None)
         start_disconnect_timer(guild)
         return
 
@@ -623,11 +641,6 @@ async def play_next(guild):
     cancel_disconnect_timer(music)
 
     try:
-        audio = await get_audio_url(song["webpage_url"])
-
-        if audio.get("duration"):
-            song["duration"] = audio["duration"]
-
         if music.voice_client is None or not music.voice_client.is_connected():
             raise RuntimeError("Der Voice-Client ist nicht mehr verbunden.")
 
@@ -663,6 +676,8 @@ async def play_next(guild):
         music.start_time = time.time()
         music.paused_since = None
         music.paused_total = 0.0
+
+        await set_voice_status(music.voice_client.channel, f"Playing: {song['title']}")
 
         if music.update_task and not music.update_task.done():
             music.update_task.cancel()
@@ -1099,14 +1114,16 @@ async def play(interaction: discord.Interaction, song: str):
 
     if not music.playing and not music.starting_song:
         await interaction.followup.send(
-            f"🎵 **{song_data['title']}** wird abgespielt."
+            f"🎵 **{song_data['title']}** wird abgespielt.",
+            ephemeral=True,
         )
         await play_next(interaction.guild)
     else:
         position = len(music.queue)
         await interaction.followup.send(
             f"✅ **{song_data['title']}** wurde zur Queue hinzugefügt.\n"
-            f"📋 Position: **{position}**"
+            f"📋 Position: **{position}**",
+            ephemeral=True,
         )
 
 
@@ -1154,6 +1171,8 @@ async def stop(interaction: discord.Interaction):
             vc.stop()
         except Exception:
             pass
+
+        await set_voice_status(vc.channel, None)
 
         try:
             await vc.disconnect()
