@@ -174,9 +174,22 @@ _BASE_YTDL_OPTIONS = {
 
 if COOKIES_FILE and os.path.exists(COOKIES_FILE):
     _BASE_YTDL_OPTIONS["cookiefile"] = COOKIES_FILE
-    print(f"yt-dlp: Cookie-Datei geladen ({COOKIES_FILE}).")
+    _cookie_size = os.path.getsize(COOKIES_FILE)
+    with open(COOKIES_FILE, "r", encoding="utf-8", errors="ignore") as _f:
+        _cookie_lines = [l for l in _f if l.strip() and not l.startswith("#")]
+    print(
+        f"yt-dlp: Cookie-Datei geladen ({COOKIES_FILE}, "
+        f"{_cookie_size} Bytes, {len(_cookie_lines)} Cookie-Einträge)."
+    )
+    if _cookie_size < 500 or len(_cookie_lines) < 5:
+        print(
+            "WARNUNG: Cookie-Datei wirkt sehr klein/leer. "
+            "Vermutlich kein vollständiger Export -> erneut exportieren."
+        )
 elif COOKIES_FILE:
     print(f"WARNUNG: COOKIES_FILE gesetzt, aber Datei nicht gefunden: {COOKIES_FILE}")
+else:
+    print("WARNUNG: COOKIES_FILE ist nicht gesetzt -> yt-dlp läuft ohne Cookies.")
 
 YTDL_SEARCH_OPTIONS = {
     **_BASE_YTDL_OPTIONS,
