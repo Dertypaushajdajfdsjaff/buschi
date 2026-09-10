@@ -516,6 +516,19 @@ async def play(interaction: discord.Interaction, song: str):
         )
         return
 
+    except RuntimeError as error:
+        print("====================================")
+        print("VOICE FEHLER: RUNTIMEERROR")
+        print(f"Typ: {type(error).__name__}")
+        print(f"Fehler: {repr(error)}")
+        print("====================================")
+
+        await interaction.followup.send(
+            "❌ Voice konnte nicht gestartet werden.\n"
+            f"Details: `{str(error)[:500]}`"
+        )
+        return
+
     except discord.ClientException as error:
         print("====================================")
         print("VOICE FEHLER: CLIENTEXCEPTION")
