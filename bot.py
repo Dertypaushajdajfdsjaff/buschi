@@ -160,7 +160,7 @@ _BASE_YTDL_OPTIONS = {
     "geo_bypass": True,
     "extractor_args": {
         "youtube": {
-            "player_client": ["android", "web"],
+            "player_client": ["android", "web", "ios"],
         }
     },
     "http_headers": {
@@ -186,7 +186,11 @@ YTDL_SEARCH_OPTIONS = {
 
 YTDL_AUDIO_OPTIONS = {
     **_BASE_YTDL_OPTIONS,
-    "format": "bestaudio/best",
+    # Fallback-Kette: falls kein reines Audio-Format verfügbar ist (kommt bei
+    # manchen Videos/Clients vor -> "Requested format is not available"),
+    # greift der Bot notfalls auf ein gemuxtes Video+Audio-Format zurück und
+    # extrahiert daraus per ffmpeg (-vn) trotzdem nur den Ton.
+    "format": "bestaudio[ext=m4a]/bestaudio/best[height<=480]/best",
 }
 
 FFMPEG_OPTIONS = {
