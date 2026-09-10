@@ -2,6 +2,7 @@ import os
 import time
 import asyncio
 import traceback
+import copy
 from collections import deque
 from datetime import datetime
 
@@ -170,6 +171,15 @@ def get_music(guild_id):
 # oft zusätzlich zu Cookies einen "Proof of Origin"-Token verlangt.
 # POT_PROVIDER_URL z.B. "http://bgutil-provider.railway.internal:4416"
 POT_PROVIDER_URL = os.getenv("POT_PROVIDER_URL")
+YTDLP_JS_RUNTIME = os.getenv("YTDLP_JS_RUNTIME")
+YTDLP_USER_AGENT = os.getenv(
+    "YTDLP_USER_AGENT",
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/139.0.0.0 Safari/537.36"
+    ),
+)
 
 _BASE_YTDL_OPTIONS = {
     "quiet": True,
@@ -182,11 +192,7 @@ _BASE_YTDL_OPTIONS = {
         }
     },
     "http_headers": {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        )
+        "User-Agent": YTDLP_USER_AGENT,
     },
 }
 
@@ -195,6 +201,10 @@ if POT_PROVIDER_URL:
         "base_url": [POT_PROVIDER_URL]
     }
     print(f"yt-dlp: PO-Token-Provider konfiguriert ({POT_PROVIDER_URL}).")
+
+if YTDLP_JS_RUNTIME:
+    _BASE_YTDL_OPTIONS["js_runtimes"] = {YTDLP_JS_RUNTIME: {}}
+    print(f"yt-dlp: JS-Runtime konfiguriert ({YTDLP_JS_RUNTIME}).")
 
 if COOKIES_FILE and os.path.exists(COOKIES_FILE):
     _BASE_YTDL_OPTIONS["cookiefile"] = COOKIES_FILE
@@ -215,20 +225,20 @@ elif COOKIES_FILE:
 else:
     print("WARNUNG: COOKIES_FILE ist nicht gesetzt -> yt-dlp läuft ohne Cookies.")
 
-YTDL_SEARCH_OPTIONS = {
-    **_BASE_YTDL_OPTIONS,
+YTDL_SEARCH_OPTIONS = copy.deepcopy(_BASE_YTDL_OPTIONS)
+YTDL_SEARCH_OPTIONS.update({
     "default_search": "ytsearch",
     "extract_flat": True,
-}
+})
 
-YTDL_AUDIO_OPTIONS = {
-    **_BASE_YTDL_OPTIONS,
+YTDL_AUDIO_OPTIONS = copy.deepcopy(_BASE_YTDL_OPTIONS)
+YTDL_AUDIO_OPTIONS.update({
     # Fallback-Kette: falls kein reines Audio-Format verfügbar ist (kommt bei
     # manchen Videos/Clients vor -> "Requested format is not available"),
     # greift der Bot notfalls auf ein gemuxtes Video+Audio-Format zurück und
     # extrahiert daraus per ffmpeg (-vn) trotzdem nur den Ton.
     "format": "bestaudio[ext=m4a]/bestaudio/best[height<=480]/best",
-}
+})
 
 FFMPEG_OPTIONS = {
     "before_options": (
@@ -244,7 +254,11 @@ YTDL_RETRY_DELAY = 2  # Sekunden
 
 
 async def _run_with_retries(func, *, retries=YTDL_MAX_RETRIES, timeout=30, label="yt-dlp"):
-    """Führt eine blockierende yt-dlp Funktion im Executor aus, mit Retries."""
+    """Führt yt-dlp außerhalb des Event-Loops aus und versucht temporäre Fehler erneut.
+
+    Der spezielle YouTube-Login/Bot-Block wird nicht sinnlos dreimal hintereinander
+    wiederholt: Ohne neue Cookies/IP/PO-Token würde das nur Zeit verschwenden.
+    """
     loop = asyncio.get_running_loop()
     last_error = None
 
@@ -256,7 +270,24 @@ async def _run_with_retries(func, *, retries=YTDL_MAX_RETRIES, timeout=30, label
             )
         except Exception as error:
             last_error = error
-            print(f"[{label}] Versuch {attempt}/{retries} fehlgeschlagen: {repr(error)}")
+            message = str(error)
+            is_bot_block = (
+                "Sign in to confirm" in message
+                or "not a bot" in message.lower()
+                or "confirm you're not a bot" in message.lower()
+            )
+
+            if is_bot_block:
+                print(
+                    f"[{label}] YouTube blockiert die Anfrage: "
+                    "Sign in / bot verification erforderlich."
+                )
+                raise
+
+            print(
+                f"[{label}] Versuch {attempt}/{retries} fehlgeschlagen: "
+                f"{type(error).__name__}: {error}"
+            )
             if attempt < retries:
                 await asyncio.sleep(YTDL_RETRY_DELAY)
 
@@ -293,6 +324,28 @@ async def get_audio_url(webpage_url):
             }
 
     return await _run_with_retries(extract, timeout=45, label="Audio-Extraktion")
+
+
+def is_youtube_bot_block(error):
+    text = str(error).lower()
+    return (
+        "sign in to confirm" in text
+        or "not a bot" in text
+        or "confirm you're not a bot" in text
+        or "use --cookies-from-browser" in text
+    )
+
+
+def cancel_disconnect_timer(music):
+    if music.disconnect_task and not music.disconnect_task.done():
+        music.disconnect_task.cancel()
+    music.disconnect_task = None
+
+
+def start_disconnect_timer(guild):
+    music = get_music(guild.id)
+    cancel_disconnect_timer(music)
+    music.disconnect_task = asyncio.create_task(auto_disconnect_after_idle(guild))
 
 
 def format_duration(seconds):
@@ -429,6 +482,7 @@ async def play_next(guild):
     if music.voice_client is None or not music.voice_client.is_connected():
         music.playing = False
         music.current = None
+        cancel_disconnect_timer(music)
         return
 
     if music.starting_song:
@@ -438,25 +492,17 @@ async def play_next(guild):
         music.playing = False
         music.current = None
         print(f"Queue von {guild.name} ist leer.")
-
-        # Alten Auto-Disconnect-Timer abbrechen, falls vorhanden.
-        if music.disconnect_task and not music.disconnect_task.done():
-            music.disconnect_task.cancel()
-
-        # Nach 15 Minuten ohne neue Musik automatisch den Call verlassen.
-        music.disconnect_task = asyncio.create_task(
-            auto_disconnect_after_idle(guild)
-        )
-
+        start_disconnect_timer(guild)
         return
 
     music.starting_song = True
     song = music.queue.popleft()
     music.current = song
+    cancel_disconnect_timer(music)
 
     try:
         audio = await get_audio_url(song["webpage_url"])
-        # Duration ggf. aus der frischen Extraktion übernehmen (genauer als Suchergebnis).
+
         if audio.get("duration"):
             song["duration"] = audio["duration"]
 
@@ -471,12 +517,14 @@ async def play_next(guild):
 
         def after_play(error):
             if error:
-                print(f"Audio-Fehler: {repr(error)}")
-
-            asyncio.run_coroutine_threadsafe(
-                song_finished(guild),
-                bot.loop,
-            )
+                print(f"Audio-Fehler bei '{song['title']}': {repr(error)}")
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    song_finished(guild),
+                    bot.loop,
+                )
+            except Exception as callback_error:
+                print(f"Fehler beim Song-Callback: {repr(callback_error)}")
 
         music.voice_client.play(source, after=after_play)
         music.playing = True
@@ -501,26 +549,41 @@ async def play_next(guild):
     except Exception as error:
         music.playing = False
         music.current = None
-        print("====================================")
-        print("FEHLER BEIM ABSPIELEN:")
-        print(f"Typ: {type(error).__name__}")
-        print(f"Fehler: {repr(error)}")
-        traceback.print_exc()
-        print("====================================")
+
+        if is_youtube_bot_block(error):
+            print(
+                f"YouTube-Bot-Block bei '{song['title']}'. "
+                "COOKIES_FILE/PO-Token/JS-Runtime prüfen."
+            )
+            error_message = (
+                f"❌ YouTube blockiert **{song['title']}** auf dem Railway-Server.\n"
+                "Bitte aktuelle YouTube-Cookies über `COOKIES_FILE` bereitstellen "
+                "und – falls weiterhin nötig – einen PO-Token-Provider konfigurieren.\n"
+                "Der Bot versucht automatisch den nächsten Song."
+            )
+        else:
+            print(
+                f"Fehler beim Abspielen von '{song['title']}': "
+                f"{type(error).__name__}: {error}"
+            )
+            error_message = (
+                f"❌ **{song['title']}** konnte nicht abgespielt werden. "
+                "Der Bot versucht automatisch den nächsten Song."
+            )
 
         if music.text_channel:
             try:
-                await music.text_channel.send(
-                    f"❌ Fehler beim Abspielen von **{song['title']}**:\n"
-                    f"```{str(error)[:1500]}```"
-                )
+                await music.text_channel.send(error_message)
             except Exception:
                 pass
 
-        # Nächsten Song versuchen, falls einer in der Queue ist.
+        # Nicht an der Queue hängen bleiben: nächsten Song versuchen.
         if music.queue:
             await asyncio.sleep(0.5)
             await play_next(guild)
+        else:
+            start_disconnect_timer(guild)
+
     finally:
         music.starting_song = False
 
@@ -803,9 +866,7 @@ async def play(interaction: discord.Interaction, song: str):
     music.text_channel = interaction.channel
 
     # Neue Musik angefordert -> Auto-Disconnect-Timer abbrechen.
-    if music.disconnect_task and not music.disconnect_task.done():
-        music.disconnect_task.cancel()
-        music.disconnect_task = None
+    cancel_disconnect_timer(music)
 
     # ========================================================
     # SONG SUCHEN
@@ -948,9 +1009,7 @@ async def stop(interaction: discord.Interaction):
     if music.update_task and not music.update_task.done():
         music.update_task.cancel()
 
-    if music.disconnect_task and not music.disconnect_task.done():
-        music.disconnect_task.cancel()
-        music.disconnect_task = None
+    cancel_disconnect_timer(music)
 
     vc = interaction.guild.voice_client
 
@@ -1089,6 +1148,10 @@ async def on_ready():
     print(f"Bot online: {bot.user}")
     print("Voice-Ping-System: AKTIV")
     print("Music-System: AKTIV")
+    print(f"Auto-Disconnect: {AUTO_DISCONNECT_DELAY // 60} Minuten")
+    print(f"YouTube-Cookies: {'AKTIV' if 'cookiefile' in _BASE_YTDL_OPTIONS else 'NICHT GESETZT'}")
+    print(f"YouTube-PO-Token: {'AKTIV' if POT_PROVIDER_URL else 'NICHT GESETZT'}")
+    print(f"YouTube-JS-Runtime: {'AKTIV' if YTDLP_JS_RUNTIME else 'OPTIONAL / NICHT GESETZT'}")
     print("====================================")
 
     try:
