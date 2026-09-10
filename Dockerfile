@@ -13,5 +13,6 @@ RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r requirements.txt
 
 COPY bot.py .
+COPY cookies.txt
 
 CMD ["python", "bot.py"]
