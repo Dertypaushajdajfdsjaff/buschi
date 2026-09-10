@@ -1,0 +1,5 @@
+discord.py[voice]
+python-dotenv
+yt-dlp[default]>=2025.11.12
+bgutil-ytdlp-pot-provider
+PyNaCl
