@@ -29,7 +29,7 @@ VOICE_COOLDOWN = 10 * 60
 
 # Kanal-ID, in die das Audit-Log gepostet wird.
 # <-- HIER die Channel-ID deines Log-Kanals eintragen.
-AUDIT_LOG_CHANNEL_ID = 0
+AUDIT_LOG_CHANNEL_ID = 1534701792061816872
 
 # ============================================================
 # DISCORD INTENTS
