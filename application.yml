@@ -1,0 +1,61 @@
+server:
+  port: 2333
+  address: 0.0.0.0
+
+lavalink:
+  server:
+    password: "youshallnotpass"   # unbedingt aendern und als LAVALINK_PASSWORD im Bot setzen
+    sources:
+      youtube: false   # eingebaute Quelle AUS -> stattdessen das aktiv gepflegte Plugin unten nutzen
+      soundcloud: true
+      bandcamp: true
+      twitch: true
+      vimeo: true
+      http: true
+    bufferDurationMs: 400
+    frameBufferDurationMs: 5000
+    opusEncodingQuality: 10
+    resamplingQuality: LOW
+    trackStuckThresholdMs: 10000
+    useSeekGhosting: true
+
+  plugins:
+    # Aktiv gepflegtes YouTube-Plugin (ersetzt die eingebaute, oft veraltete
+    # YouTube-Quelle). Kuemmert sich selbst um PO-Token / OAuth / Client-Wahl.
+    - dependency: "dev.lavalink.youtube:youtube-plugin:1.13.3"
+      repository: "https://maven.lavalink.dev/releases"
+
+plugins:
+  youtube:
+    enabled: true
+    allowSearch: true
+    allowDirectVideoIds: true
+    allowDirectPlaylistIds: true
+    clients:
+      - MWEB
+      - TV
+      - WEB
+    # Optional, falls YouTube weiterhin blockt: PO-Token/OAuth wie bisher,
+    # aber zentral EINMAL hier statt pro Song ein neuer Prozess:
+    # oauth:
+    #   enabled: true
+    #   refreshToken: "..."
+    # pot:
+    #   token: "..."
+    #   visitorData: "..."
+
+  # Optional: Proxy-/IP-Rotation, falls Railway-IPs weiter geblockt werden.
+  # Braucht mehrere IPv6-Bloecke oder HTTP-Proxys, siehe:
+  # https://github.com/lavalink-devs/youtube-source/blob/main/COMMON.md#using-a-remote-cipher-server
+  # ratelimit:
+  #   ipBlocks: ["<dein-ipv6-block>/64"]
+  #   strategy: "RotateOnBan"
+
+metrics:
+  prometheus:
+    enabled: false
+
+logging:
+  level:
+    root: INFO
+    lavalink: INFO
