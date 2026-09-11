@@ -139,7 +139,7 @@ class GuildMusic:
         self.starting_song = False
 
         # Für das erweiterte "Now Playing"-Widget:
-        self.volume = 1.0
+        self.volume = 0.5
         self.repeat = False
         self.liked = set()  # Titel gemochter Songs (nur im RAM, pro Session)
         self.now_playing_message = None
@@ -640,6 +640,7 @@ async def play_next(guild):
     song = music.queue.popleft()
     music.current = song
     cancel_disconnect_timer(music)
+    t_start = time.time()
 
     try:
         if music.voice_client is None or not music.voice_client.is_connected():
@@ -651,6 +652,7 @@ async def play_next(guild):
 
         proc = start_ytdlp_stream(song["webpage_url"])
         music.ytdlp_process = proc
+        print(f"[Timing] yt-dlp-Prozess gestartet nach {time.time() - t_start:.2f}s")
 
         raw_source = discord.FFmpegPCMAudio(
             proc.stdout,
@@ -673,6 +675,7 @@ async def play_next(guild):
                 print(f"Fehler beim Song-Callback: {repr(callback_error)}")
 
         music.voice_client.play(source, after=after_play)
+        print(f"[Timing] vc.play() aufgerufen nach {time.time() - t_start:.2f}s (ab Songstart)")
         music.playing = True
         music.history.appendleft(song)
         music.start_time = time.time()
