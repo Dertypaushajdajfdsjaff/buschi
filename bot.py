@@ -4,6 +4,7 @@ import asyncio
 import traceback
 import copy
 import subprocess
+import threading
 from collections import deque
 from datetime import datetime
 
@@ -404,19 +405,67 @@ def build_ytdlp_cli_args(webpage_url):
     return args
 
 
-def start_ytdlp_stream(webpage_url):
+YTDLP_DEBUG = os.getenv("YTDLP_DEBUG", "0").lower() in {"1", "true", "yes", "on"}
+
+
+def _log_ytdlp_stderr(proc, t_spawn, label):
+    """Liest stderr des externen yt-dlp-Prozesses zeilenweise und prefixt
+    jede Zeile mit der seit dem Spawn vergangenen Zeit. Läuft in einem
+    eigenen Thread, damit der Event-Loop nicht blockiert wird. Das ist der
+    einzige Weg, die INTERNE yt-dlp-Zeit (Extraction, PO-Token-Request,
+    Formatwahl, erster Chunk) sichtbar zu machen - Popen()/vc.play() kehren
+    immer sofort zurück und sagen darüber nichts aus."""
+    try:
+        for raw_line in iter(proc.stderr.readline, b""):
+            line = raw_line.decode(errors="replace").rstrip()
+            if line:
+                print(f"[yt-dlp t+{time.time() - t_spawn:.2f}s][{label}] {line}")
+    except Exception as error:
+        print(f"[{label}] Fehler beim Lesen von yt-dlp-stderr: {repr(error)}")
+    finally:
+        try:
+            proc.stderr.close()
+        except Exception:
+            pass
+
+
+def start_ytdlp_stream(webpage_url, label="stream"):
     """Startet yt-dlp als eigenen Prozess, der die Audiodaten direkt an
     stdout streamt (statt ffmpeg die googlevideo.com-URL selbst abrufen zu
     lassen). Dadurch läuft der komplette YouTube-Request - inkl. Cookies,
     PO-Token und Headern - über yt-dlp's eigene, dafür konfigurierte
     HTTP-Session. Vermeidet 403 Forbidden durch abweichende Request-Header
-    oder Verbindungspfade zwischen Extraktion und Wiedergabe."""
+    oder Verbindungspfade zwischen Extraktion und Wiedergabe.
+
+    WICHTIG zum Timing: Popen() kehrt sofort zurück, sobald der Prozess
+    gestartet wurde - das sagt NICHTS darüber aus, wann tatsächlich
+    Audiodaten fließen. Die eigentliche Verzögerung (YouTube-Extraction,
+    PO-Token-Abruf über den bgutil-Provider, JS-Runtime-Start) passiert
+    danach, komplett innerhalb dieses externen Prozesses. Bei aktivem
+    YTDLP_DEBUG wird stderr mitgeloggt, damit man sieht, WO die Zeit
+    wirklich verloren geht.
+    """
+    t_spawn = time.time()
     args = build_ytdlp_cli_args(webpage_url)
-    return subprocess.Popen(
+
+    if YTDLP_DEBUG and "--verbose" not in args:
+        args = args + ["--verbose"]
+
+    proc = subprocess.Popen(
         args,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE if YTDLP_DEBUG else subprocess.DEVNULL,
     )
+    proc._t_spawn = t_spawn  # eigenes Attribut, nur für unsere Timing-Logs
+
+    if YTDLP_DEBUG:
+        threading.Thread(
+            target=_log_ytdlp_stderr,
+            args=(proc, t_spawn, label),
+            daemon=True,
+        ).start()
+
+    return proc
 
 
 def stop_ytdlp_process(music):
@@ -650,9 +699,29 @@ async def play_next(guild):
         # neuer gestartet wird.
         stop_ytdlp_process(music)
 
-        proc = start_ytdlp_stream(song["webpage_url"])
+        preproc = song.pop("_preproc", None)
+        if preproc is not None and preproc.poll() is None:
+            # Wurde schon vorab (parallel zum Voice-Connect) gestartet ->
+            # weiterverwenden statt doppelt zu extrahieren.
+            proc = preproc
+            t_spawn = getattr(proc, "_t_spawn", t_start)
+            print(
+                f"[Timing] Nutze vorab gestarteten yt-dlp-Prozess "
+                f"(bereits seit {time.time() - t_spawn:.2f}s am Laufen, "
+                f"{time.time() - t_start:.2f}s seit play_next-Aufruf)"
+            )
+        else:
+            if preproc is not None:
+                # war schon tot/abgebrochen -> sauber wegwerfen
+                try:
+                    preproc.terminate()
+                except Exception:
+                    pass
+            proc = start_ytdlp_stream(song["webpage_url"], label="play_next")
+            t_spawn = proc._t_spawn
+            print(f"[Timing] yt-dlp-Prozess gestartet nach {time.time() - t_start:.2f}s")
+
         music.ytdlp_process = proc
-        print(f"[Timing] yt-dlp-Prozess gestartet nach {time.time() - t_start:.2f}s")
 
         raw_source = discord.FFmpegPCMAudio(
             proc.stdout,
@@ -675,7 +744,14 @@ async def play_next(guild):
                 print(f"Fehler beim Song-Callback: {repr(callback_error)}")
 
         music.voice_client.play(source, after=after_play)
-        print(f"[Timing] vc.play() aufgerufen nach {time.time() - t_start:.2f}s (ab Songstart)")
+        print(
+            f"[Timing] vc.play() aufgerufen nach {time.time() - t_start:.2f}s "
+            f"(ab play_next) / {time.time() - t_spawn:.2f}s (ab yt-dlp-Spawn). "
+            "Hinweis: das misst nur, wie schnell der Python-Code bis hierhin kommt "
+            "(Popen()/vc.play() sind nicht-blockierend) - NICHT, wann tatsächlich "
+            "Ton zu hören ist. Mit YTDLP_DEBUG=1 siehst du in den "
+            "[yt-dlp t+...s]-Zeilen, wo die echte Zeit verloren geht."
+        )
         music.playing = True
         music.history.appendleft(song)
         music.start_time = time.time()
@@ -1077,11 +1153,41 @@ async def play(interaction: discord.Interaction, song: str):
     }
 
     # ========================================================
+    # EXTRACTION VORAB STARTEN (paralleles Timing!)
+    # ========================================================
+    # Der eigentliche 10s-Delay entsteht NICHT durch vc.play(), sondern
+    # innerhalb des externen yt-dlp-Prozesses (YouTube-Extraction,
+    # PO-Token-Abruf, Formatwahl) - komplett bevor der erste Byte fließt.
+    # Popen() selbst kehrt sofort zurück, der Kindprozess läuft danach
+    # unabhängig vom asyncio-Event-Loop im Hintergrund weiter.
+    # Wenn dieser Song sofort dran wäre (Queue leer, nichts läuft), starten
+    # wir yt-dlp deshalb JETZT schon, statt erst nach dem Voice-Connect in
+    # play_next(). Dadurch laufen Extraction und Voice-Connect (bis zu 20s
+    # Timeout) parallel, statt sich zu addieren.
+    # Bei bereits laufender Musik lassen wir das bewusst weg: der Prozess
+    # würde sonst evtl. lange auf einen freien Pipe-Puffer warten
+    # (Default 64KB -> blockiert nach ein paar Sekunden ungelesener Daten).
+    preproc = None
+    if not music.playing and not music.starting_song and not music.queue:
+        print(f"[Timing] Starte yt-dlp-Extraction vorab (parallel zum Voice-Connect) für '{song_data['title']}'")
+        preproc = start_ytdlp_stream(webpage_url, label="prefetch")
+        song_data["_preproc"] = preproc
+
+    # ========================================================
     # VOICE JOIN / RECONNECT
     # ========================================================
     vc, voice_error = await connect_voice(interaction, voice_channel)
 
     if voice_error is not None:
+        # Vorab gestarteten Prozess wieder sauber beenden, falls der
+        # Voice-Connect fehlgeschlagen ist - sonst bleibt er als Zombie
+        # im Hintergrund hängen.
+        if preproc is not None and preproc.poll() is None:
+            try:
+                preproc.terminate()
+            except Exception:
+                pass
+
         error = voice_error
 
         if isinstance(error, discord.Forbidden):
