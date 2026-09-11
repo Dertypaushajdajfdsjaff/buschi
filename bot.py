@@ -149,6 +149,7 @@ class GuildMusic:
         self.paused_total = 0.0
         self.update_task = None
         self.disconnect_task = None
+        self.prefetch_task = None  # beobachtet Songende, um den naechsten Song vorab zu laden
         self.ytdlp_process = None  # externer yt-dlp-Prozess, der Audiodaten an ffmpeg pipet
 
 
@@ -614,6 +615,75 @@ async def now_playing_updater(guild_id):
 
 
 # ============================================================
+# PREFETCH DES NÄCHSTEN SONGS (versteckt die Extraction-Zeit
+# beim automatischen Songwechsel)
+# ============================================================
+PREFETCH_LEAD_SECONDS = 15  # wie viele Sekunden vor Songende der naechste Song vorab gestartet wird
+
+
+def discard_pending_prefetches(music):
+    """Beendet alle yt-dlp-Prozesse, die für Songs in der Queue schon vorab
+    gestartet wurden (per Prefetch), aber nie gespielt werden. Muss vor
+    jedem music.queue.clear() aufgerufen werden, sonst bleiben diese
+    Prozesse als Zombies im Hintergrund hängen."""
+    for pending_song in music.queue:
+        proc = pending_song.pop("_preproc", None)
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+
+async def prefetch_next_watcher(guild_id):
+    """Beobachtet den Fortschritt des aktuellen Songs und startet die
+    yt-dlp-Extraction für den nächsten Song in der Queue schon kurz bevor
+    der aktuelle Song endet. Dadurch ist beim automatischen Songwechsel
+    (fast) keine Wartezeit mehr spürbar.
+
+    Bewusst erst kurz vor Songende (statt sofort bei Songstart): würde man
+    sofort prefetchen, müsste der yt-dlp-Prozess evtl. minutenlang auf
+    einen vollen Pipe-Puffer warten (Standard 64KB, nur ein paar Sekunden
+    Audio) - und die zugrunde liegende YouTube-Verbindung könnte in der
+    Zeit per Idle-Timeout abbrechen. Kurz vor Songende ist das Risiko
+    dafür minimal.
+    """
+    music = get_music(guild_id)
+    song_ref = music.current
+    prefetched_for = None
+
+    try:
+        while (
+            music.current is song_ref
+            and music.voice_client is not None
+            and music.voice_client.is_connected()
+        ):
+            duration = song_ref.get("duration") if song_ref else None
+
+            if duration:
+                remaining = duration - get_elapsed_seconds(music)
+
+                if remaining <= PREFETCH_LEAD_SECONDS and music.queue:
+                    next_song = music.queue[0]
+
+                    if next_song is not prefetched_for and "_preproc" not in next_song:
+                        print(
+                            f"[Timing] Starte Prefetch für nächsten Song "
+                            f"'{next_song['title']}' ({max(0, remaining):.1f}s vor Songende)"
+                        )
+                        next_song["_preproc"] = start_ytdlp_stream(
+                            next_song["webpage_url"], label="prefetch-next"
+                        )
+                        prefetched_for = next_song
+
+            await asyncio.sleep(2)
+    except asyncio.CancelledError:
+        pass
+    except Exception as error:
+        print(f"Fehler im Prefetch-Watcher: {repr(error)}")
+
+
+# ============================================================
 # AUTO-DISCONNECT NACH 15 MINUTEN OHNE MUSIK
 # ============================================================
 AUTO_DISCONNECT_DELAY = 15 * 60  # 15 Minuten
@@ -762,6 +832,10 @@ async def play_next(guild):
 
         if music.update_task and not music.update_task.done():
             music.update_task.cancel()
+
+        if music.prefetch_task and not music.prefetch_task.done():
+            music.prefetch_task.cancel()
+        music.prefetch_task = asyncio.create_task(prefetch_next_watcher(guild.id))
 
         if music.text_channel:
             embed = create_music_embed(music, music.voice_client.channel.name)
@@ -916,10 +990,15 @@ class MusicView(discord.ui.View):
     @discord.ui.button(label="Stop", emoji="⏹️", style=discord.ButtonStyle.danger, row=0)
     async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         music = get_music(self.guild_id)
+        discard_pending_prefetches(music)
         music.queue.clear()
 
         if music.update_task and not music.update_task.done():
             music.update_task.cancel()
+
+        if music.prefetch_task and not music.prefetch_task.done():
+            music.prefetch_task.cancel()
+        music.prefetch_task = None
 
         if music.disconnect_task and not music.disconnect_task.done():
             music.disconnect_task.cancel()
@@ -1267,11 +1346,16 @@ async def stop(interaction: discord.Interaction):
         return
 
     music = get_music(interaction.guild.id)
+    discard_pending_prefetches(music)
     music.queue.clear()
     stop_ytdlp_process(music)
 
     if music.update_task and not music.update_task.done():
         music.update_task.cancel()
+
+    if music.prefetch_task and not music.prefetch_task.done():
+        music.prefetch_task.cancel()
+    music.prefetch_task = None
 
     cancel_disconnect_timer(music)
 
