@@ -1196,6 +1196,86 @@ async def stop(interaction: discord.Interaction):
 
 
 # ============================================================
+# /CLEAR
+# ============================================================
+@bot.tree.command(
+    name="clear",
+    description="Löscht eine Anzahl an Nachrichten in diesem Kanal.",
+)
+@app_commands.describe(anzahl="Wie viele Nachrichten gelöscht werden sollen (1-100)")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def clear(interaction: discord.Interaction, anzahl: app_commands.Range[int, 1, 100]):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "❌ Nur auf einem Server möglich.", ephemeral=True
+        )
+        return
+
+    channel = interaction.channel
+
+    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        await interaction.response.send_message(
+            "❌ In diesem Kanaltyp können keine Nachrichten gelöscht werden.",
+            ephemeral=True,
+        )
+        return
+
+    bot_member = interaction.guild.me
+    if not channel.permissions_for(bot_member).manage_messages:
+        await interaction.response.send_message(
+            "❌ Mir fehlt die Berechtigung **Nachrichten verwalten** in diesem Kanal.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        deleted = await channel.purge(limit=anzahl)
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "❌ Mir fehlt die Berechtigung, Nachrichten in diesem Kanal zu löschen.",
+            ephemeral=True,
+        )
+        return
+    except discord.HTTPException as error:
+        await interaction.followup.send(
+            f"❌ Fehler beim Löschen: `{error}`",
+            ephemeral=True,
+        )
+        return
+
+    anzahl_geloescht = len(deleted)
+    await interaction.followup.send(
+        f"🧹 {anzahl_geloescht} "
+        f"{'Nachricht wurde' if anzahl_geloescht == 1 else 'Nachrichten wurden'} gelöscht.",
+        ephemeral=True,
+    )
+
+
+@clear.error
+async def clear_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "❌ Du brauchst die Berechtigung **Nachrichten verwalten**, "
+            "um diesen Befehl zu nutzen.",
+            ephemeral=True,
+        )
+        return
+
+    print(f"Fehler bei /clear: {type(error).__name__}: {error}")
+
+    if interaction.response.is_done():
+        await interaction.followup.send(
+            "❌ Es ist ein unerwarteter Fehler aufgetreten.", ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            "❌ Es ist ein unerwarteter Fehler aufgetreten.", ephemeral=True
+        )
+
+
+# ============================================================
 # /QUEUE
 # ============================================================
 @bot.tree.command(name="queue", description="Zeigt die aktuelle Musik-Queue.")
