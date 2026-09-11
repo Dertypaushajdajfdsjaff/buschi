@@ -268,11 +268,12 @@ YTDL_SEARCH_OPTIONS.update({
 
 YTDL_AUDIO_OPTIONS = copy.deepcopy(_BASE_YTDL_OPTIONS)
 YTDL_AUDIO_OPTIONS.update({
-    # Fallback-Kette: falls kein reines Audio-Format verfügbar ist (kommt bei
-    # manchen Videos/Clients vor -> "Requested format is not available"),
-    # greift der Bot notfalls auf ein gemuxtes Video+Audio-Format zurück und
-    # extrahiert daraus per ffmpeg (-vn) trotzdem nur den Ton.
-    "format": "bestaudio[ext=m4a]/bestaudio/best[height<=480]/best",
+    # Seit dem Pipe-Fix liest ffmpeg die Audiodaten sequenziell (kein
+    # Zurückspulen möglich). webm/opus lässt sich fortlaufend dekodieren,
+    # m4a/mp4 hat seine Metadaten ("moov atom") dagegen oft am Dateiende -
+    # dann muss ffmpeg fast die komplette Datei laden, bevor es starten
+    # kann. Deshalb webm zuerst, m4a nur als Fallback.
+    "format": "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best[height<=480]/best",
 })
 
 FFMPEG_OPTIONS = {
@@ -654,6 +655,7 @@ async def play_next(guild):
         raw_source = discord.FFmpegPCMAudio(
             proc.stdout,
             pipe=True,
+            before_options="-analyzeduration 0 -probesize 32k",
             options="-vn",
         )
         source = discord.PCMVolumeTransformer(raw_source, volume=music.volume)
