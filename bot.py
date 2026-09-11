@@ -439,10 +439,11 @@ async def play(interaction: discord.Interaction, song: str):
     cancel_disconnect_timer(music)
 
     # Suche/Auflösung läuft ueber den Lavalink-Node (kein eigener yt-dlp-
-    # Prozess mehr im Bot). Reiner Text -> ytsearch, Link -> direkt.
-    query = song if song.startswith("http") else f"ytsearch:{song}"
+    # Prozess mehr im Bot). wavelink haengt bei reinem Suchtext selbst
+    # schon ein Praefix an (z.B. ytmsearch:) - hier NICHT nochmal eins
+    # voranstellen, sonst entsteht ein ungueltiges Doppel-Praefix.
     try:
-        results = await wavelink.Playable.search(query)
+        results = await wavelink.Playable.search(song)
     except Exception as error:
         print(f"Fehler bei Lavalink-Suche: {type(error).__name__}: {error}")
         await interaction.followup.send(f"❌ Fehler bei der Suche:\n```{str(error)[:1800]}```")
