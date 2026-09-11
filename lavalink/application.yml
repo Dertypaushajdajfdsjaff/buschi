@@ -4,7 +4,7 @@ server:
 
 lavalink:
   server:
-    password: "youshallnotpass"   # unbedingt aendern und als LAVALINK_PASSWORD im Bot setzen
+    password: "Fortnite"   # unbedingt aendern und als LAVALINK_PASSWORD im Bot setzen
     sources:
       youtube: false   # eingebaute Quelle AUS -> stattdessen das aktiv gepflegte Plugin unten nutzen
       soundcloud: true
