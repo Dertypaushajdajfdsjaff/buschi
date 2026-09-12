@@ -1,6 +1,7 @@
 import os
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import discord
 from discord.ext import commands
@@ -24,8 +25,12 @@ if not TOKEN:
 # EINSTELLUNGEN
 # ============================================================
 VOICE_CHANNEL_ID = 1534654223923282015
-TEXT_CHANNEL_ID = 1534656181161693334
+TEXT_CHANNEL_ID = 1548313708961202226
 VOICE_COOLDOWN = 10 * 60
+
+# Zeitzone für alle angezeigten Uhrzeiten (Server, z.B. Railway, läuft
+# in der Regel in UTC -> ohne diese Umrechnung wäre die Uhrzeit falsch).
+LOCAL_TIMEZONE = ZoneInfo("Europe/Berlin")
 
 # Kanal-ID, in die das Audit-Log gepostet wird.
 # <-- HIER die Channel-ID deines Log-Kanals eintragen.
@@ -90,7 +95,7 @@ async def on_voice_state_update(member, before, after):
         print("Voice-Ping Textkanal wurde nicht gefunden.")
         return
 
-    uhrzeit = datetime.now().strftime("%H:%M Uhr")
+    uhrzeit = datetime.now(LOCAL_TIMEZONE).strftime("%H:%M Uhr")
 
     embed = discord.Embed(
         title="🟢  Voice Aktiv",
