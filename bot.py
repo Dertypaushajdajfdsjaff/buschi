@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import time
+import traceback
 from collections import deque
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -561,6 +562,10 @@ class Track:
 
 
 YTDLP_TIMEOUT_SECONDS = 180
+# Eigene Kopien: yt_dlp.YoutubeDL() verändert das übergebene Options-Dict
+# (z.B. wird "outtmpl" dort zu einem dict umgebaut) -> nicht daraus lesen.
+YTDLP_FORMAT = "bestaudio/best"
+YTDLP_OUTTMPL = os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s")
 
 
 def _lower_priority():
@@ -581,11 +586,11 @@ async def extract_track(query, requester):
     """
     args = [
         sys.executable, "-m", "yt_dlp",
-        "--format", YTDL_OPTIONS["format"],
+        "--format", YTDLP_FORMAT,
         "--no-playlist",
         "--quiet", "--no-warnings",
         "--default-search", "ytsearch",
-        "--output", YTDL_OPTIONS["outtmpl"],
+        "--output", YTDLP_OUTTMPL,
         "--restrict-filenames",
         "--geo-bypass",
         "--dump-single-json", "--no-simulate",
@@ -628,7 +633,7 @@ async def extract_track(query, requester):
     downloads = data.get("requested_downloads") or []
     filepath = (downloads[0].get("filepath") if downloads else None) or data.get("_filename")
     if not filepath:
-        filepath = ytdl.prepare_filename(data)
+        filepath = str(ytdl.prepare_filename(data))
 
     if not os.path.exists(filepath):
         raise FileNotFoundError("Die heruntergeladene Audiodatei wurde nicht gefunden.")
@@ -1045,6 +1050,7 @@ async def play(interaction: discord.Interaction, song: str):
     try:
         track = await extract_track(song, member)
     except Exception as error:
+        traceback.print_exc()
         await interaction.followup.send(f"❌ Song konnte nicht geladen werden: `{error}`")
         return
 
