@@ -1,6 +1,7 @@
 import asyncio
 import functools
 import os
+import tempfile
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -456,25 +457,35 @@ async def clear_error(interaction: discord.Interaction, error: app_commands.AppC
 # ============================================================
 # MUSIC BOT SYSTEM
 # ============================================================
+# Musik-Dateien werden hier zwischengespeichert (statt live gestreamt).
+# Grund: Der direkte Stream-Link von YouTube ist an die IP gebunden, die ihn
+# angefragt hat. Auf Hostern wie Railway kann die ausgehende IP zwischen der
+# yt-dlp-Anfrage und dem Öffnen des Links durch ffmpeg wechseln -> 403 Forbidden.
+# Wenn stattdessen yt-dlp selbst herunterlädt, spielt das keine Rolle mehr.
+DOWNLOAD_DIR = tempfile.mkdtemp(prefix="musicbot_")
+
 YTDL_OPTIONS = {
     "format": "bestaudio/best",
     "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
     "default_search": "ytsearch",
-    "source_address": "0.0.0.0",
-    "extract_flat": False,
+    "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
+    "restrictfilenames": True,
+    "geo_bypass": True,
+    # Der "android"-Client umgeht viele der aktuellen YouTube-Drosselungen/
+    # Signatur-Probleme, die sonst zu 403ern oder leerer Wiedergabe führen.
+    "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
 }
 
 FFMPEG_OPTIONS = {
-    "before_options": (
-        "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
-    ),
+    "before_options": "",
     "options": "-vn",
 }
 
 AUTO_DISCONNECT_SECONDS = 5 * 60  # Nach 5 Minuten Inaktivität den Voice-Channel verlassen
 PROGRESS_UPDATE_SECONDS = 10  # Wie oft die "Now Playing"-Nachricht aktualisiert wird
+HISTORY_LIMIT = 5  # Wie viele zuletzt gespielte Songs für "Zurück" vorgehalten werden
 
 ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
 
@@ -482,9 +493,9 @@ ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
 class Track:
     """Repräsentiert einen einzelnen Song in der Warteschlange."""
 
-    def __init__(self, data, requester):
+    def __init__(self, data, requester, filepath):
         self.title = data.get("title") or "Unbekannter Titel"
-        self.stream_url = data.get("url")
+        self.filepath = filepath
         self.webpage_url = data.get("webpage_url")
         self.duration = data.get("duration") or 0
         self.thumbnail = data.get("thumbnail")
@@ -493,8 +504,8 @@ class Track:
 
 
 async def extract_track(query, requester):
-    """Lädt Song-Infos von YouTube (blockierend), daher im Executor ausgeführt."""
-    partial = functools.partial(ytdl.extract_info, query, download=False)
+    """Lädt den Song von YouTube herunter (blockierend), daher im Executor."""
+    partial = functools.partial(ytdl.extract_info, query, download=True)
     data = await bot.loop.run_in_executor(None, partial)
 
     if data is None:
@@ -506,7 +517,36 @@ async def extract_track(query, requester):
             raise ValueError("Keine Ergebnisse gefunden.")
         data = entries[0]
 
-    return Track(data, requester)
+    filepath = ytdl.prepare_filename(data)
+    return Track(data, requester, filepath)
+
+
+def cleanup_track_file(track):
+    """Löscht die heruntergeladene Audiodatei eines Songs, falls vorhanden."""
+    if track is not None and track.filepath and os.path.exists(track.filepath):
+        try:
+            os.remove(track.filepath)
+        except OSError as error:
+            print(f"Konnte temporäre Musikdatei nicht löschen: {error}")
+
+
+def add_to_history(state, track):
+    """Merkt sich den gespielten Song für den 'Zurück'-Button und räumt alte Dateien auf."""
+    state.history.append(track)
+    while len(state.history) > HISTORY_LIMIT:
+        old_track = state.history.popleft()
+        cleanup_track_file(old_track)
+
+
+def cleanup_all_tracks(state):
+    """Löscht alle noch vorhandenen Audiodateien (aktueller Song, Warteschlange, Verlauf)."""
+    cleanup_track_file(state.current)
+    for track in list(state.queue):
+        cleanup_track_file(track)
+    for track in list(state.history):
+        cleanup_track_file(track)
+    state.queue.clear()
+    state.history.clear()
 
 
 class GuildMusicState:
@@ -515,7 +555,7 @@ class GuildMusicState:
     def __init__(self, guild_id):
         self.guild_id = guild_id
         self.queue = deque()
-        self.history = deque(maxlen=10)
+        self.history = deque()
         self.voice_client = None
         self.current = None
         self.volume = 0.5  # 0.0 - 2.0 (also 0% - 200%)
@@ -653,6 +693,7 @@ def schedule_auto_disconnect(state):
             except Exception:
                 pass
             state.voice_client = None
+            cleanup_all_tracks(state)
 
     state.disconnect_task = bot.loop.create_task(_disconnect_later())
 
@@ -682,7 +723,7 @@ async def play_next_track(state):
         next_track = state.current
     else:
         if state.current is not None:
-            state.history.append(state.current)
+            add_to_history(state, state.current)
 
         if not state.queue:
             state.current = None
@@ -704,9 +745,14 @@ async def play_next_track(state):
 
     state.current = next_track
 
+    if not next_track.filepath or not os.path.exists(next_track.filepath):
+        print(f"Audiodatei für '{next_track.title}' fehlt, überspringe.")
+        await play_next_track(state)
+        return
+
     try:
         source = discord.PCMVolumeTransformer(
-            discord.FFmpegPCMAudio(next_track.stream_url, **FFMPEG_OPTIONS),
+            discord.FFmpegPCMAudio(next_track.filepath, **FFMPEG_OPTIONS),
             volume=state.volume,
         )
     except Exception as error:
@@ -793,8 +839,6 @@ class MusicControlView(discord.ui.View):
     @discord.ui.button(label="Stop", emoji="⏹️", style=discord.ButtonStyle.danger, row=1)
     async def stop_playback(self, interaction: discord.Interaction, button: discord.ui.Button):
         state = self.get_state()
-        state.queue.clear()
-        state.history.clear()
         state.loop_current = False
         cancel_update_task(state)
         cancel_auto_disconnect(state)
@@ -807,6 +851,7 @@ class MusicControlView(discord.ui.View):
                 pass
 
         state.voice_client = None
+        cleanup_all_tracks(state)
         state.current = None
 
         embed = discord.Embed(
@@ -919,8 +964,6 @@ async def stop_command(interaction: discord.Interaction):
         return
 
     state = get_music_state(interaction.guild.id)
-    state.queue.clear()
-    state.history.clear()
     state.loop_current = False
     cancel_update_task(state)
     cancel_auto_disconnect(state)
@@ -933,6 +976,7 @@ async def stop_command(interaction: discord.Interaction):
             pass
 
     state.voice_client = None
+    cleanup_all_tracks(state)
     state.current = None
     await interaction.response.send_message("⏹️ Wiedergabe gestoppt und Voice-Channel verlassen.", ephemeral=True)
 
@@ -1001,7 +1045,7 @@ async def music_auto_leave(member, before, after):
         pass
 
     state.voice_client = None
-    state.queue.clear()
+    cleanup_all_tracks(state)
     state.current = None
     cancel_update_task(state)
     cancel_auto_disconnect(state)
