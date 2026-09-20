@@ -15,6 +15,11 @@ RUN pip install --no-cache-dir --upgrade pip \
 
 COPY bot.py .
 
+# Optionale cookies.txt fürs YouTube-Login (siehe README).
+# Das Klammer-Pattern sorgt dafür, dass der Build auch klappt, wenn die
+# Datei (noch) nicht existiert - Docker bricht dann nicht ab.
+COPY cookies.tx[t] ./
+
 ENV PYTHONUNBUFFERED=1
 
 CMD ["python", "-u", "bot.py"]
