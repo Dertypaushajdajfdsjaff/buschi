@@ -1,8 +1,10 @@
 import asyncio
 import json
 import os
+import queue
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from collections import deque
@@ -834,6 +836,63 @@ async def send_or_refresh_now_playing(state):
         print(f"Fehler beim Senden der Now-Playing-Nachricht: {error}")
 
 
+class BufferedAudio(discord.AudioSource):
+    """Liest die ffmpeg-Ausgabe in einem Hintergrund-Thread vor und puffert sie.
+
+    Ohne Puffer startet ffmpeg erst, wenn die Wiedergabe beginnt. Ist die CPU
+    gerade knapp, kommen die ersten Frames zu spät und der Anfang ruckelt.
+    Mit Puffer wird erst abgespielt, wenn bereits ~1 Sekunde Audio bereitliegt;
+    kurze CPU-Aussetzer später im Song werden ebenfalls abgefangen.
+    """
+
+    FRAME_BYTES = 3840  # 20 ms, 48 kHz, 16 Bit, Stereo
+
+    def __init__(self, source, prebuffer_frames=50, max_frames=500):
+        self.source = source
+        self.prebuffer_frames = prebuffer_frames
+        self.queue = queue.Queue(maxsize=max_frames)
+        self.ready = threading.Event()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._fill, daemon=True)
+        self._thread.start()
+
+    def _fill(self):
+        try:
+            while not self._stop.is_set():
+                data = self.source.read()
+                while not self._stop.is_set():
+                    try:
+                        self.queue.put(data, timeout=0.5)
+                        break
+                    except queue.Full:
+                        continue
+                if self.queue.qsize() >= self.prebuffer_frames:
+                    self.ready.set()
+                if not data:  # Ende der Datei
+                    return
+        finally:
+            self.ready.set()
+
+    def wait_ready(self, timeout=5.0):
+        self.ready.wait(timeout)
+
+    def read(self):
+        try:
+            return self.queue.get(timeout=0.02)
+        except queue.Empty:
+            if self._stop.is_set():
+                return b""
+            return b"\x00" * self.FRAME_BYTES  # Puffer leer -> kurze Stille statt Abbruch
+
+    def cleanup(self):
+        self._stop.set()
+        self.ready.set()
+        try:
+            self.source.cleanup()
+        except Exception:
+            pass
+
+
 async def play_next_track(state):
     """Startet den nächsten Song aus der Warteschlange (oder wiederholt den aktuellen)."""
     if state.voice_client is None or not state.voice_client.is_connected():
@@ -870,14 +929,21 @@ async def play_next_track(state):
         await play_next_track(state)
         return
 
+    buffered = None
     try:
-        source = discord.PCMVolumeTransformer(
-            discord.FFmpegPCMAudio(next_track.filepath, **FFMPEG_OPTIONS),
-            volume=state.volume,
-        )
+        buffered = BufferedAudio(discord.FFmpegPCMAudio(next_track.filepath, **FFMPEG_OPTIONS))
+        await asyncio.to_thread(buffered.wait_ready, 5.0)
+        source = discord.PCMVolumeTransformer(buffered, volume=state.volume)
     except Exception as error:
         print(f"Fehler beim Erstellen der Audio-Quelle: {error}")
+        if buffered is not None:
+            buffered.cleanup()
         await play_next_track(state)
+        return
+
+    # Während des Vorpufferns kann der Bot gestoppt worden sein.
+    if state.voice_client is None or not state.voice_client.is_connected():
+        source.cleanup()
         return
 
     def after_playback(error):
