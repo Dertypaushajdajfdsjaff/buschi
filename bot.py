@@ -717,7 +717,7 @@ class GuildMusicState:
         self.history = deque()
         self.voice_client = None
         self.current = None
-        self.volume = 0.5  # 0.0 - 2.0 (also 0% - 200%)
+        self.volume = 0.5  # 0.0 - 1.0 (also 0% - 100%)
         self.loop_current = False
         self.text_channel = None
         self.now_playing_message = None
@@ -1164,7 +1164,7 @@ class MusicControlView(discord.ui.View):
     @discord.ui.button(label="Lauter", emoji="🔊", style=discord.ButtonStyle.secondary, row=2)
     async def volume_up(self, interaction: discord.Interaction, button: discord.ui.Button):
         state = self.get_state()
-        state.volume = min(2.0, round(state.volume + 0.1, 2))
+        state.volume = min(1.0, round(state.volume + 0.1, 2))
         if state.voice_client and state.voice_client.source:
             state.voice_client.source.volume = state.volume
         await interaction.response.edit_message(embed=build_now_playing_embed(state), view=self)
@@ -1290,9 +1290,9 @@ async def queue_command(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="volume", description="Stellt die Lautstärke ein (0-200%).")
+@bot.tree.command(name="volume", description="Stellt die Lautstärke ein (0-100%).")
 @app_commands.describe(prozent="Lautstärke in Prozent, z.B. 50")
-async def volume_command(interaction: discord.Interaction, prozent: app_commands.Range[int, 0, 200]):
+async def volume_command(interaction: discord.Interaction, prozent: app_commands.Range[int, 0, 100]):
     if interaction.guild is None:
         await interaction.response.send_message("❌ Nur auf einem Server möglich.", ephemeral=True)
         return
