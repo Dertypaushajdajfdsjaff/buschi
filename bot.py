@@ -578,14 +578,20 @@ def _lower_priority():
         pass
 
 
-async def extract_track(query, requester):
-    """Lädt den Song per yt-dlp herunter.
+# Fehlermeldungen, bei denen sich ein neuer Versuch mit anderen Einstellungen lohnt
+# (YouTube liefert mit Login-Cookies zurzeit oft "The page needs to be reloaded").
+YTDLP_RETRYABLE = (
+    "needs to be reloaded",
+    "HTTP Error 403",
+    "Sign in to confirm",
+    "player response",
+    "Requested format is not available",
+)
+YTDLP_EMBED_ARGS = ["--extractor-args", "youtube:player_client=default,web_embedded"]
 
-    Läuft bewusst in einem EIGENEN Prozess mit niedriger Priorität statt in einem
-    Thread des Bots: yt-dlp verbraucht beim Auswerten der YouTube-Seite viel
-    Python-CPU. Im selben Prozess blockiert das über die GIL den Audio-Thread
-    (Opus-Encoding + Senden) und der aktuell laufende Song ruckelt.
-    """
+
+async def _run_ytdlp(query, use_cookies, extra_args):
+    """Führt yt-dlp einmal aus und gibt die JSON-Antwort (dict) zurück."""
     args = [
         sys.executable, "-m", "yt_dlp",
         "--format", YTDLP_FORMAT,
@@ -597,8 +603,9 @@ async def extract_track(query, requester):
         "--geo-bypass",
         "--dump-single-json", "--no-simulate",
     ]
-    if COOKIES_FILE_PATH:
+    if use_cookies and COOKIES_FILE_PATH:
         args += ["--cookies", COOKIES_FILE_PATH]
+    args += list(extra_args)
     args += ["--", query]
 
     proc = await asyncio.create_subprocess_exec(
@@ -619,9 +626,39 @@ async def extract_track(query, requester):
         raise RuntimeError(lines[-1][:300] if lines else "yt-dlp ist fehlgeschlagen.")
 
     try:
-        data = json.loads(stdout.decode("utf-8"))
+        return json.loads(stdout.decode("utf-8"))
     except json.JSONDecodeError:
         raise ValueError("Keine Ergebnisse gefunden.")
+
+
+async def extract_track(query, requester):
+    """Lädt den Song per yt-dlp herunter.
+
+    Läuft bewusst in einem EIGENEN Prozess mit niedriger Priorität statt in einem
+    Thread des Bots: yt-dlp verbraucht beim Auswerten der YouTube-Seite viel
+    Python-CPU. Im selben Prozess blockiert das über die GIL den Audio-Thread
+    (Opus-Encoding + Senden) und der aktuell laufende Song ruckelt.
+
+    Schlägt YouTube mit den Standard-Einstellungen fehl, werden automatisch
+    weitere Varianten probiert (anderer Player-Client, zuletzt ohne Cookies).
+    """
+    if COOKIES_FILE_PATH:
+        attempts = [(True, []), (True, YTDLP_EMBED_ARGS), (False, [])]
+    else:
+        attempts = [(False, []), (False, YTDLP_EMBED_ARGS)]
+
+    data = None
+    for number, (use_cookies, extra_args) in enumerate(attempts, start=1):
+        try:
+            data = await _run_ytdlp(query, use_cookies, extra_args)
+            if number > 1:
+                print(f"[yt-dlp] Versuch {number} war erfolgreich.")
+            break
+        except RuntimeError as error:
+            retryable = any(text in str(error) for text in YTDLP_RETRYABLE)
+            if number == len(attempts) or not retryable:
+                raise
+            print(f"[yt-dlp] Versuch {number} fehlgeschlagen ({error}) -> neuer Versuch")
 
     if data is None:
         raise ValueError("Keine Ergebnisse gefunden.")
