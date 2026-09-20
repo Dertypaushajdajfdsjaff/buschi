@@ -1,6 +1,7 @@
 import asyncio
-import functools
+import json
 import os
+import sys
 import tempfile
 import time
 from collections import deque
@@ -559,10 +560,61 @@ class Track:
         self.liked = False
 
 
+YTDLP_TIMEOUT_SECONDS = 180
+
+
+def _lower_priority():
+    """Läuft im Kindprozess: yt-dlp bekommt weniger CPU-Priorität als der Bot/ffmpeg."""
+    try:
+        os.nice(10)
+    except (AttributeError, OSError):
+        pass
+
+
 async def extract_track(query, requester):
-    """Lädt den Song von YouTube herunter (blockierend), daher im Executor."""
-    partial = functools.partial(ytdl.extract_info, query, download=True)
-    data = await bot.loop.run_in_executor(None, partial)
+    """Lädt den Song per yt-dlp herunter.
+
+    Läuft bewusst in einem EIGENEN Prozess mit niedriger Priorität statt in einem
+    Thread des Bots: yt-dlp verbraucht beim Auswerten der YouTube-Seite viel
+    Python-CPU. Im selben Prozess blockiert das über die GIL den Audio-Thread
+    (Opus-Encoding + Senden) und der aktuell laufende Song ruckelt.
+    """
+    args = [
+        sys.executable, "-m", "yt_dlp",
+        "--format", YTDL_OPTIONS["format"],
+        "--no-playlist",
+        "--quiet", "--no-warnings",
+        "--default-search", "ytsearch",
+        "--output", YTDL_OPTIONS["outtmpl"],
+        "--restrict-filenames",
+        "--geo-bypass",
+        "--dump-single-json", "--no-simulate",
+    ]
+    if COOKIES_FILE_PATH:
+        args += ["--cookies", COOKIES_FILE_PATH]
+    args += ["--", query]
+
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        preexec_fn=_lower_priority,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), YTDLP_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise RuntimeError("Download hat zu lange gedauert (Timeout).")
+
+    if proc.returncode != 0:
+        lines = stderr.decode("utf-8", "replace").strip().splitlines()
+        raise RuntimeError(lines[-1][:300] if lines else "yt-dlp ist fehlgeschlagen.")
+
+    try:
+        data = json.loads(stdout.decode("utf-8"))
+    except json.JSONDecodeError:
+        raise ValueError("Keine Ergebnisse gefunden.")
 
     if data is None:
         raise ValueError("Keine Ergebnisse gefunden.")
@@ -573,7 +625,14 @@ async def extract_track(query, requester):
             raise ValueError("Keine Ergebnisse gefunden.")
         data = entries[0]
 
-    filepath = ytdl.prepare_filename(data)
+    downloads = data.get("requested_downloads") or []
+    filepath = (downloads[0].get("filepath") if downloads else None) or data.get("_filename")
+    if not filepath:
+        filepath = ytdl.prepare_filename(data)
+
+    if not os.path.exists(filepath):
+        raise FileNotFoundError("Die heruntergeladene Audiodatei wurde nicht gefunden.")
+
     return Track(data, requester, filepath)
 
 
