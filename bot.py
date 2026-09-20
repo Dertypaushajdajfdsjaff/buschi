@@ -467,22 +467,46 @@ DOWNLOAD_DIR = tempfile.mkdtemp(prefix="musicbot_")
 # ------------------------------------------------------------
 # YouTube-Cookies (gegen 403 / "Sign in to confirm you're not a bot")
 # ------------------------------------------------------------
-# Zwei Wege, wie Cookies bereitgestellt werden können:
-#   1) YOUTUBE_COOKIES       - der komplette Inhalt einer cookies.txt
-#                              (Netscape-Format) als Railway-Variable
+# Wege, wie Cookies bereitgestellt werden können:
+#   1) YOUTUBE_COOKIES + YOUTUBE_COOKIES_PART2, _PART3, ...
+#      -> Inhalt einer cookies.txt (Netscape-Format), aufgeteilt auf mehrere
+#         Railway-Variablen (Railway erlaubt max. 32768 Zeichen pro Variable).
+#         Mit dem Skript split_cookies.py lässt sich eine cookies.txt dafür
+#         automatisch in passende Teile zerlegen.
 #   2) YOUTUBE_COOKIES_FILE  - Pfad zu einer bereits vorhandenen Datei
-# Fällt beides weg, wird lokal nach einer "cookies.txt" neben bot.py gesucht.
+# Fällt alles weg, wird lokal nach einer "cookies.txt" neben bot.py gesucht.
 COOKIES_FILE_PATH = None
 
-_cookies_env_content = os.getenv("YOUTUBE_COOKIES")
+
+def _collect_cookie_parts():
+    parts = []
+    first_part = os.getenv("YOUTUBE_COOKIES")
+    if first_part:
+        parts.append(first_part)
+
+    index = 2
+    while True:
+        part = os.getenv(f"YOUTUBE_COOKIES_PART{index}")
+        if part is None:
+            break
+        parts.append(part)
+        index += 1
+
+    return parts
+
+
+_cookie_parts = _collect_cookie_parts()
 _cookies_env_path = os.getenv("YOUTUBE_COOKIES_FILE")
 
-if _cookies_env_content:
+if _cookie_parts:
     _cookies_tmp_path = os.path.join(DOWNLOAD_DIR, "cookies.txt")
     with open(_cookies_tmp_path, "w", encoding="utf-8") as _cookie_file:
-        _cookie_file.write(_cookies_env_content)
+        _cookie_file.write("".join(_cookie_parts))
     COOKIES_FILE_PATH = _cookies_tmp_path
-    print("YouTube-Cookies aus YOUTUBE_COOKIES (Env-Variable) geladen.")
+    if len(_cookie_parts) > 1:
+        print(f"YouTube-Cookies aus {len(_cookie_parts)} Env-Variablen zusammengesetzt.")
+    else:
+        print("YouTube-Cookies aus YOUTUBE_COOKIES (Env-Variable) geladen.")
 elif _cookies_env_path and os.path.exists(_cookies_env_path):
     COOKIES_FILE_PATH = _cookies_env_path
     print(f"YouTube-Cookies aus Datei geladen: {_cookies_env_path}")
@@ -501,9 +525,10 @@ YTDL_OPTIONS = {
     "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
     "restrictfilenames": True,
     "geo_bypass": True,
-    # Der "android"-Client umgeht viele der aktuellen YouTube-Drosselungen/
-    # Signatur-Probleme, die sonst zu 403ern oder leerer Wiedergabe führen.
-    "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+    # Kein fest erzwungener player_client mehr: der "android"-Client liefert bei
+    # manchen Videos keine separaten Audio-Formate ("bestaudio" schlägt dann
+    # fehl). Mit den YouTube-Cookies (siehe unten) übernimmt yt-dlp die
+    # Client-Auswahl selbst und findet zuverlässig ein passendes Audio-Format.
 }
 
 if COOKIES_FILE_PATH:
