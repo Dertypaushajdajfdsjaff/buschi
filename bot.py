@@ -464,6 +464,34 @@ async def clear_error(interaction: discord.Interaction, error: app_commands.AppC
 # Wenn stattdessen yt-dlp selbst herunterlädt, spielt das keine Rolle mehr.
 DOWNLOAD_DIR = tempfile.mkdtemp(prefix="musicbot_")
 
+# ------------------------------------------------------------
+# YouTube-Cookies (gegen 403 / "Sign in to confirm you're not a bot")
+# ------------------------------------------------------------
+# Zwei Wege, wie Cookies bereitgestellt werden können:
+#   1) YOUTUBE_COOKIES       - der komplette Inhalt einer cookies.txt
+#                              (Netscape-Format) als Railway-Variable
+#   2) YOUTUBE_COOKIES_FILE  - Pfad zu einer bereits vorhandenen Datei
+# Fällt beides weg, wird lokal nach einer "cookies.txt" neben bot.py gesucht.
+COOKIES_FILE_PATH = None
+
+_cookies_env_content = os.getenv("YOUTUBE_COOKIES")
+_cookies_env_path = os.getenv("YOUTUBE_COOKIES_FILE")
+
+if _cookies_env_content:
+    _cookies_tmp_path = os.path.join(DOWNLOAD_DIR, "cookies.txt")
+    with open(_cookies_tmp_path, "w", encoding="utf-8") as _cookie_file:
+        _cookie_file.write(_cookies_env_content)
+    COOKIES_FILE_PATH = _cookies_tmp_path
+    print("YouTube-Cookies aus YOUTUBE_COOKIES (Env-Variable) geladen.")
+elif _cookies_env_path and os.path.exists(_cookies_env_path):
+    COOKIES_FILE_PATH = _cookies_env_path
+    print(f"YouTube-Cookies aus Datei geladen: {_cookies_env_path}")
+elif os.path.exists("cookies.txt"):
+    COOKIES_FILE_PATH = os.path.abspath("cookies.txt")
+    print("YouTube-Cookies aus lokaler cookies.txt geladen.")
+else:
+    print("Keine YouTube-Cookies gefunden - Wiedergabe läuft ohne Login (kann zu 403 führen).")
+
 YTDL_OPTIONS = {
     "format": "bestaudio/best",
     "noplaylist": True,
@@ -477,6 +505,9 @@ YTDL_OPTIONS = {
     # Signatur-Probleme, die sonst zu 403ern oder leerer Wiedergabe führen.
     "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
 }
+
+if COOKIES_FILE_PATH:
+    YTDL_OPTIONS["cookiefile"] = COOKIES_FILE_PATH
 
 FFMPEG_OPTIONS = {
     "before_options": "",
