@@ -544,7 +544,7 @@ FFMPEG_OPTIONS = {
 }
 
 AUTO_DISCONNECT_SECONDS = 5 * 60  # Nach 5 Minuten Inaktivität den Voice-Channel verlassen
-PROGRESS_UPDATE_SECONDS = 10  # Wie oft die "Now Playing"-Nachricht aktualisiert wird
+PROGRESS_UPDATE_SECONDS = 15  # Wie oft die "Now Playing"-Nachricht aktualisiert wird
 HISTORY_LIMIT = 5  # Wie viele zuletzt gespielte Songs für "Zurück" vorgehalten werden
 
 ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
@@ -688,6 +688,8 @@ class GuildMusicState:
         self.paused_at_elapsed = 0
         self.update_task = None
         self.disconnect_task = None
+        self.status_channel_id = None
+        self.status_text = None
 
     def is_active(self):
         return self.voice_client is not None and (
@@ -713,7 +715,7 @@ def format_duration(seconds):
     return f"{m:02d}:{s:02d}"
 
 
-def build_progress_bar(elapsed, total, length=18):
+def build_progress_bar(elapsed, total, length=12):
     if not total:
         return "▬" * length
     fraction = max(0.0, min(1.0, elapsed / total))
@@ -734,6 +736,8 @@ def get_elapsed(state):
 def build_now_playing_embed(state):
     track = state.current
     elapsed = get_elapsed(state)
+    if track.duration:
+        elapsed = min(elapsed, track.duration)
     bar = build_progress_bar(elapsed, track.duration)
 
     vc = state.voice_client
@@ -757,7 +761,7 @@ def build_now_playing_embed(state):
     embed.add_field(name="Voice", value=status, inline=True)
     embed.add_field(name="Lautstärke", value=f"{int(round(state.volume * 100))}%", inline=True)
     embed.add_field(
-        name="Wiederholen",
+        name="Repeat",
         value="An 🔁" if state.loop_current else "Aus",
         inline=True,
     )
@@ -789,6 +793,12 @@ def start_progress_updater(state):
         if state.current is None or state.now_playing_message is None:
             updater.stop()
             return
+        vc = state.voice_client
+        if vc is not None and vc.is_paused():
+            return
+        latency = getattr(vc, "average_latency", 0) if vc is not None else 0
+        if latency and latency != float("inf") and latency > 0.25:
+            print(f"[Voice] Hohe Latenz zum Discord-Voice-Server: {int(latency * 1000)} ms")
         try:
             await state.now_playing_message.edit(embed=build_now_playing_embed(state))
         except (discord.NotFound, discord.HTTPException):
@@ -810,6 +820,7 @@ def schedule_auto_disconnect(state):
     async def _disconnect_later():
         await asyncio.sleep(AUTO_DISCONNECT_SECONDS)
         if state.voice_client and not state.is_active() and not state.queue:
+            await clear_voice_status(state)
             try:
                 await state.voice_client.disconnect(force=True)
             except Exception:
@@ -851,6 +862,7 @@ class BufferedAudio(discord.AudioSource):
         self.source = source
         self.prebuffer_frames = prebuffer_frames
         self.queue = queue.Queue(maxsize=max_frames)
+        self.underruns = 0
         self.ready = threading.Event()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._fill, daemon=True)
@@ -882,15 +894,59 @@ class BufferedAudio(discord.AudioSource):
         except queue.Empty:
             if self._stop.is_set():
                 return b""
+            self.underruns += 1
             return b"\x00" * self.FRAME_BYTES  # Puffer leer -> kurze Stille statt Abbruch
 
     def cleanup(self):
+        print(f"[Audio] Song beendet, Puffer-Unterläufe: {self.underruns}")
         self._stop.set()
         self.ready.set()
         try:
             self.source.cleanup()
         except Exception:
             pass
+
+
+async def set_voice_channel_status(channel_id, status):
+    """Setzt den Status des Voice-Channels (None = löschen).
+
+    Benötigt die Bot-Berechtigung "Sprachkanal-Status festlegen" im Voice-Channel.
+    """
+    try:
+        route = discord.http.Route(
+            "PUT", "/channels/{channel_id}/voice-status", channel_id=channel_id
+        )
+        await bot.http.request(route, json={"status": status})
+    except discord.Forbidden:
+        print(
+            "WARNUNG: Bot darf den Voice-Channel-Status nicht setzen -> "
+            "Berechtigung 'Sprachkanal-Status festlegen' im Voice-Channel geben."
+        )
+    except Exception as error:
+        print(f"Fehler beim Setzen des Voice-Channel-Status: {type(error).__name__}: {error}")
+
+
+async def update_voice_status(state, track):
+    """Zeigt 'Playing: <Songname>' als Status des Voice-Channels an."""
+    if state.voice_client is None or state.voice_client.channel is None:
+        return
+    title = track.title if len(track.title) <= 100 else track.title[:99] + "…"
+    text = f"Playing: {title}"
+    channel_id = state.voice_client.channel.id
+    if state.status_text == text and state.status_channel_id == channel_id:
+        return
+    state.status_channel_id = channel_id
+    state.status_text = text
+    await set_voice_channel_status(channel_id, text)
+
+
+async def clear_voice_status(state):
+    """Entfernt den Status wieder (Wiedergabe beendet / Bot verlässt den Channel)."""
+    channel_id = state.status_channel_id
+    state.status_channel_id = None
+    state.status_text = None
+    if channel_id:
+        await set_voice_channel_status(channel_id, None)
 
 
 async def play_next_track(state):
@@ -907,6 +963,7 @@ async def play_next_track(state):
         if not state.queue:
             state.current = None
             cancel_update_task(state)
+            await clear_voice_status(state)
             if state.now_playing_message is not None:
                 embed = discord.Embed(
                     title="📭 Warteschlange beendet",
@@ -954,6 +1011,7 @@ async def play_next_track(state):
     state.voice_client.play(source, after=after_playback)
     state.play_started_at = time.time()
     state.paused_at_elapsed = 0
+    bot.loop.create_task(update_voice_status(state, next_track))
 
     await send_or_refresh_now_playing(state)
     start_progress_updater(state)
@@ -999,8 +1057,8 @@ class MusicControlView(discord.ui.View):
         vc = state.voice_client
 
         if vc.is_playing():
+            state.paused_at_elapsed = get_elapsed(state)  # vor pause(), sonst springt der Balken auf 0
             vc.pause()
-            state.paused_at_elapsed = get_elapsed(state)
             state.play_started_at = None
             button.label, button.emoji = "Weiter", "▶️"
         elif vc.is_paused():
@@ -1028,6 +1086,7 @@ class MusicControlView(discord.ui.View):
         state.loop_current = False
         cancel_update_task(state)
         cancel_auto_disconnect(state)
+        await clear_voice_status(state)
 
         if state.voice_client is not None:
             try:
@@ -1104,7 +1163,7 @@ async def play(interaction: discord.Interaction, song: str):
 
     if state.voice_client is None or not state.voice_client.is_connected():
         try:
-            state.voice_client = await voice_channel.connect()
+            state.voice_client = await voice_channel.connect(self_deaf=True)
         except Exception as error:
             await interaction.followup.send(f"❌ Konnte dem Voice-Channel nicht beitreten: `{error}`")
             return
@@ -1154,6 +1213,7 @@ async def stop_command(interaction: discord.Interaction):
     state.loop_current = False
     cancel_update_task(state)
     cancel_auto_disconnect(state)
+    await clear_voice_status(state)
 
     if state.voice_client is not None:
         try:
@@ -1224,6 +1284,8 @@ async def music_auto_leave(member, before, after):
     non_bot_members = [m for m in voice_channel.members if not m.bot]
     if non_bot_members:
         return
+
+    await clear_voice_status(state)
 
     try:
         state.voice_client.stop()
