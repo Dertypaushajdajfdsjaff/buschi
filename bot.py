@@ -1338,6 +1338,29 @@ async def music_auto_leave(member, before, after):
 
 
 # ============================================================
+# WECHSELNDER BOT-STATUS
+# ============================================================
+STATUS_TEXTE = [
+    "🛠️ Made by Harlem",
+    "🤖 Erstellt durch bot.py",
+]
+
+@tasks.loop(seconds=5)
+async def rotating_bot_status():
+    """Wechselt alle 5 Sekunden den sichtbaren Discord-Bot-Status."""
+    index = rotating_bot_status.current_loop % len(STATUS_TEXTE)
+    await bot.change_presence(
+        status=discord.Status.online,
+        activity=discord.Game(name=STATUS_TEXTE[index]),
+    )
+
+
+@rotating_bot_status.before_loop
+async def before_rotating_bot_status():
+    await bot.wait_until_ready()
+
+
+# ============================================================
 # BOT READY
 # ============================================================
 @bot.event
@@ -1356,6 +1379,9 @@ async def on_ready():
         print(f"{len(synced)} Slash Commands synchronisiert.")
     except Exception as error:
         print(f"Fehler beim Synchronisieren: {type(error).__name__}: {error}")
+
+    if not rotating_bot_status.is_running():
+        rotating_bot_status.start()
 
 
 # ============================================================
