@@ -8,7 +8,7 @@ import threading
 import time
 import traceback
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 import discord
@@ -1338,10 +1338,341 @@ async def music_auto_leave(member, before, after):
 
 
 # ============================================================
+# /HELP + ADMIN / UTILITY COMMANDS
+# ============================================================
+@bot.tree.command(name="help", description="Zeigt alle verfügbaren Bot-Befehle nach Kategorien an.")
+async def help_command(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="📚 Bot Hilfe",
+        description="Hier findest du alle verfügbaren Befehle, übersichtlich nach Kategorien sortiert.",
+        color=discord.Color.blurple(),
+    )
+
+    embed.add_field(
+        name="🎵 MUSIC",
+        value=(
+            "`/play <song>` – Song abspielen oder zur Queue hinzufügen\n"
+            "`/skip` – aktuellen Song überspringen\n"
+            "`/stop` – Musik stoppen und Bot aus Voice entfernen\n"
+            "`/queue` – aktuelle Warteschlange anzeigen\n"
+            "`/volume <0-100>` – Lautstärke einstellen"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🛡️ ADMIN",
+        value=(
+            "`/clear <anzahl>` – Nachrichten löschen\n"
+            "`/ban <user> [grund]` – User bannen\n"
+            "`/unban <user_id> [grund]` – Bann aufheben\n"
+            "`/kick <user> [grund]` – User vom Server kicken\n"
+            "`/timeout <user> <minuten> [grund]` – User timeouten\n"
+            "`/untimeout <user>` – Timeout entfernen\n"
+            "`/warn <user> [grund]` – User verwarnen\n"
+            "`/lock` – aktuellen Kanal sperren\n"
+            "`/unlock` – aktuellen Kanal entsperren"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="🔧 UTILITY",
+        value=(
+            "`/userinfo <user>` – Informationen über einen User\n"
+            "`/serverinfo` – Informationen über den Server\n"
+            "`/avatar [user]` – Avatar anzeigen"
+        ),
+        inline=False,
+    )
+
+    embed.set_footer(text="Bot • /help")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+async def _moderation_check(interaction: discord.Interaction, target: discord.Member) -> bool:
+    """Prüft, ob der ausführende User und der Bot das Ziel moderieren dürfen."""
+    if interaction.guild is None:
+        await interaction.response.send_message("❌ Nur auf einem Server möglich.", ephemeral=True)
+        return False
+
+    if target.id == interaction.user.id:
+        await interaction.response.send_message("❌ Du kannst diese Aktion nicht gegen dich selbst ausführen.", ephemeral=True)
+        return False
+
+    if target.id == interaction.guild.owner_id:
+        await interaction.response.send_message("❌ Der Serverinhaber kann nicht moderiert werden.", ephemeral=True)
+        return False
+
+    actor = interaction.user
+    if isinstance(actor, discord.Member) and actor.id != interaction.guild.owner_id:
+        if target.top_role >= actor.top_role:
+            await interaction.response.send_message(
+                "❌ Dieser User hat die gleiche oder eine höhere Rolle als du.", ephemeral=True
+            )
+            return False
+
+    me = interaction.guild.me
+    if me is not None and target.top_role >= me.top_role:
+        await interaction.response.send_message(
+            "❌ Meine höchste Rolle ist nicht hoch genug, um diesen User zu moderieren.", ephemeral=True
+        )
+        return False
+
+    return True
+
+
+@bot.tree.command(name="ban", description="Bannt einen User vom Server.")
+@app_commands.describe(user="Der User, der gebannt werden soll", grund="Grund für den Bann")
+@app_commands.checks.has_permissions(ban_members=True)
+async def ban_command(interaction: discord.Interaction, user: discord.Member, grund: str = "Kein Grund angegeben"):
+    if not await _moderation_check(interaction, user):
+        return
+
+    try:
+        await user.ban(reason=f"{grund} | Von {interaction.user}")
+        await interaction.response.send_message(
+            f"🔨 **{user}** wurde gebannt.\n📝 Grund: **{grund}**"
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Ich darf diesen User nicht bannen.", ephemeral=True)
+
+
+@ban_command.error
+async def ban_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ Du brauchst **Mitglieder bannen**.", ephemeral=True)
+    else:
+        print(f"Fehler bei /ban: {type(error).__name__}: {error}")
+
+
+@bot.tree.command(name="unban", description="Hebt den Bann eines Users per Discord-ID auf.")
+@app_commands.describe(user_id="Discord-ID des gebannten Users", grund="Grund für den Unban")
+@app_commands.checks.has_permissions(ban_members=True)
+async def unban_command(interaction: discord.Interaction, user_id: str, grund: str = "Kein Grund angegeben"):
+    if interaction.guild is None:
+        await interaction.response.send_message("❌ Nur auf einem Server möglich.", ephemeral=True)
+        return
+
+    try:
+        user = await bot.fetch_user(int(user_id))
+        await interaction.guild.unban(user, reason=f"{grund} | Von {interaction.user}")
+        await interaction.response.send_message(f"🔓 **{user}** wurde entbannt.\n📝 Grund: **{grund}**")
+    except ValueError:
+        await interaction.response.send_message("❌ Bitte eine gültige Discord-ID eingeben.", ephemeral=True)
+    except discord.NotFound:
+        await interaction.response.send_message("❌ Dieser User ist nicht gebannt oder wurde nicht gefunden.", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Ich darf keine Banns aufheben.", ephemeral=True)
+
+
+@unban_command.error
+async def unban_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ Du brauchst **Mitglieder bannen**.", ephemeral=True)
+    else:
+        print(f"Fehler bei /unban: {type(error).__name__}: {error}")
+
+
+@bot.tree.command(name="kick", description="Kickt einen User vom Server.")
+@app_commands.describe(user="Der User, der gekickt werden soll", grund="Grund für den Kick")
+@app_commands.checks.has_permissions(kick_members=True)
+async def kick_command(interaction: discord.Interaction, user: discord.Member, grund: str = "Kein Grund angegeben"):
+    if not await _moderation_check(interaction, user):
+        return
+
+    try:
+        await user.kick(reason=f"{grund} | Von {interaction.user}")
+        await interaction.response.send_message(f"👢 **{user}** wurde gekickt.\n📝 Grund: **{grund}**")
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Ich darf diesen User nicht kicken.", ephemeral=True)
+
+
+@kick_command.error
+async def kick_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ Du brauchst **Mitglieder kicken**.", ephemeral=True)
+    else:
+        print(f"Fehler bei /kick: {type(error).__name__}: {error}")
+
+
+@bot.tree.command(name="timeout", description="Gibt einem User einen Timeout in Minuten.")
+@app_commands.describe(user="Der User", minuten="Timeout-Dauer in Minuten (1-40320)", grund="Grund für den Timeout")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def timeout_command(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    minuten: app_commands.Range[int, 1, 40320],
+    grund: str = "Kein Grund angegeben",
+):
+    if not await _moderation_check(interaction, user):
+        return
+
+    try:
+        until = discord.utils.utcnow() + timedelta(minutes=minuten)
+        await user.timeout(until, reason=f"{grund} | Von {interaction.user}")
+        await interaction.response.send_message(
+            f"🔇 **{user}** wurde für **{minuten} Minuten** getimeoutet.\n📝 Grund: **{grund}**"
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Ich darf diesen User nicht timeouten.", ephemeral=True)
+
+
+@timeout_command.error
+async def timeout_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ Du brauchst **Mitglieder moderieren**.", ephemeral=True)
+    else:
+        print(f"Fehler bei /timeout: {type(error).__name__}: {error}")
+
+
+@bot.tree.command(name="untimeout", description="Entfernt den Timeout eines Users.")
+@app_commands.describe(user="Der User, dessen Timeout entfernt werden soll")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def untimeout_command(interaction: discord.Interaction, user: discord.Member):
+    if not await _moderation_check(interaction, user):
+        return
+
+    try:
+        await user.timeout(None, reason=f"Timeout entfernt | Von {interaction.user}")
+        await interaction.response.send_message(f"🔊 Timeout von **{user}** wurde entfernt.")
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Ich darf den Timeout nicht entfernen.", ephemeral=True)
+
+
+@untimeout_command.error
+async def untimeout_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ Du brauchst **Mitglieder moderieren**.", ephemeral=True)
+    else:
+        print(f"Fehler bei /untimeout: {type(error).__name__}: {error}")
+
+
+@bot.tree.command(name="warn", description="Verwarnt einen User.")
+@app_commands.describe(user="Der User", grund="Grund für die Verwarnung")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def warn_command(interaction: discord.Interaction, user: discord.Member, grund: str = "Kein Grund angegeben"):
+    if not await _moderation_check(interaction, user):
+        return
+
+    try:
+        await user.send(
+            f"⚠️ Du wurdest auf **{interaction.guild.name}** verwarnt.\n📝 Grund: **{grund}**"
+        )
+    except discord.Forbidden:
+        pass
+
+    await interaction.response.send_message(
+        f"⚠️ **{user}** wurde verwarnt.\n📝 Grund: **{grund}**"
+    )
+
+
+@warn_command.error
+async def warn_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ Du brauchst **Mitglieder moderieren**.", ephemeral=True)
+    else:
+        print(f"Fehler bei /warn: {type(error).__name__}: {error}")
+
+
+async def _set_channel_lock(interaction: discord.Interaction, locked: bool):
+    if interaction.guild is None or not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("❌ Dieser Befehl funktioniert nur in einem Textkanal.", ephemeral=True)
+        return
+
+    everyone = interaction.guild.default_role
+    overwrite = interaction.channel.overwrites_for(everyone)
+    overwrite.send_messages = False if locked else None
+
+    try:
+        await interaction.channel.set_permissions(
+            everyone,
+            overwrite=overwrite,
+            reason=f"Kanal {'gesperrt' if locked else 'entsperrt'} | Von {interaction.user}",
+        )
+        await interaction.response.send_message(
+            f"{'🔒 Kanal gesperrt.' if locked else '🔓 Kanal entsperrt.'}"
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Ich darf die Kanalberechtigungen nicht ändern.", ephemeral=True)
+
+
+@bot.tree.command(name="lock", description="Sperrt den aktuellen Textkanal für @everyone.")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def lock_command(interaction: discord.Interaction):
+    await _set_channel_lock(interaction, True)
+
+
+@lock_command.error
+async def lock_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ Du brauchst **Kanäle verwalten**.", ephemeral=True)
+    else:
+        print(f"Fehler bei /lock: {type(error).__name__}: {error}")
+
+
+@bot.tree.command(name="unlock", description="Entsperrt den aktuellen Textkanal für @everyone.")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def unlock_command(interaction: discord.Interaction):
+    await _set_channel_lock(interaction, False)
+
+
+@unlock_command.error
+async def unlock_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ Du brauchst **Kanäle verwalten**.", ephemeral=True)
+    else:
+        print(f"Fehler bei /unlock: {type(error).__name__}: {error}")
+
+
+@bot.tree.command(name="userinfo", description="Zeigt Informationen über einen User.")
+@app_commands.describe(user="Der User, über den du Informationen sehen möchtest")
+async def userinfo_command(interaction: discord.Interaction, user: discord.Member):
+    roles = [role.mention for role in reversed(user.roles[1:])]
+    embed = discord.Embed(title=f"👤 Userinfo: {user}", color=discord.Color.blurple())
+    embed.set_thumbnail(url=user.display_avatar.url)
+    embed.add_field(name="🆔 ID", value=f"`{user.id}`", inline=True)
+    embed.add_field(name="📅 Account erstellt", value=discord.utils.format_dt(user.created_at, "D"), inline=True)
+    embed.add_field(name="📥 Server beigetreten", value=discord.utils.format_dt(user.joined_at, "D") if user.joined_at else "Unbekannt", inline=True)
+    embed.add_field(name="🎭 Höchste Rolle", value=user.top_role.mention, inline=True)
+    embed.add_field(name="🤖 Bot", value="Ja" if user.bot else "Nein", inline=True)
+    embed.add_field(name="🏷️ Rollen", value=", ".join(roles) if roles else "Keine", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="serverinfo", description="Zeigt Informationen über den Server.")
+async def serverinfo_command(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message("❌ Nur auf einem Server möglich.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    embed = discord.Embed(title=f"🏠 Serverinfo: {guild.name}", color=discord.Color.blurple())
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    embed.add_field(name="🆔 Server-ID", value=f"`{guild.id}`", inline=True)
+    embed.add_field(name="👥 Mitglieder", value=str(guild.member_count), inline=True)
+    embed.add_field(name="💬 Textkanäle", value=str(len(guild.text_channels)), inline=True)
+    embed.add_field(name="🔊 Voicekanäle", value=str(len(guild.voice_channels)), inline=True)
+    embed.add_field(name="🎭 Rollen", value=str(len(guild.roles)), inline=True)
+    embed.add_field(name="📅 Erstellt", value=discord.utils.format_dt(guild.created_at, "D"), inline=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="avatar", description="Zeigt den Avatar eines Users.")
+@app_commands.describe(user="Optional: User, dessen Avatar angezeigt werden soll")
+async def avatar_command(interaction: discord.Interaction, user: discord.Member = None):
+    target = user or interaction.user
+    embed = discord.Embed(title=f"🖼️ Avatar von {target}", color=discord.Color.blurple())
+    embed.set_image(url=target.display_avatar.url)
+    await interaction.response.send_message(embed=embed)
+
+
+# ============================================================
 # WECHSELNDER BOT-STATUS
 # ============================================================
 STATUS_TEXTE = [
-    "🛠️ Made by Harlem",
+    "🛠️ Made by Harlem and AI",
     "🤖 Erstellt durch bot.py",
 ]
 
