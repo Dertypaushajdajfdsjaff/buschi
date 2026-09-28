@@ -1674,6 +1674,7 @@ async def avatar_command(interaction: discord.Interaction, user: discord.Member 
 STATUS_TEXTE = [
     "🛠️ Made by Harlem and AI",
     "🤖 Erstellt durch bot.py",
+    "🔨 /help for all commands",
 ]
 
 @tasks.loop(seconds=5)
