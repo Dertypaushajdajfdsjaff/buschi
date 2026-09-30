@@ -465,15 +465,31 @@ async def log_slash_command(interaction: discord.Interaction):
 
 
 async def log_moderation(title, color, actor, verb, target, grund=None, dauer=None):
-    """z.B. 'Spieler 1 hat Spieler 2 gebannt für: Spam'."""
-    text = f"{actor.mention} (`{actor}`) hat {target.mention} (`{target}`) **{verb}**"
-    if dauer:
-        text += f" für **{dauer}**"
-    if grund:
-        text += f" – Grund: **{grund}**" if dauer else f" für: **{grund}**"
-
+    """Moderations-Log im gleichen Stil wie das Nachricht-gelöscht-Log."""
     embed = _base_embed(title, color)
-    embed.description = text
+
+    embed.add_field(
+        name="Nutzer",
+        value=f"{target.mention} (`{target}`)",
+        inline=True,
+    )
+    embed.add_field(
+        name="Durchgeführt von",
+        value=f"{actor.mention} (`{actor}`)" if actor else "Unbekannt",
+        inline=True,
+    )
+    embed.add_field(name="Aktion", value=verb.capitalize(), inline=True)
+
+    if dauer:
+        embed.add_field(name="Dauer", value=dauer, inline=True)
+
+    embed.add_field(
+        name="Grund",
+        value=_truncate(grund) if grund else "Kein Grund angegeben",
+        inline=False,
+    )
+
+    embed.set_thumbnail(url=target.display_avatar.url)
     embed.set_footer(text=f"Ziel-ID: {target.id}")
     await send_audit_embed(embed)
 
@@ -486,9 +502,7 @@ async def on_member_ban(guild, user):
     await asyncio.sleep(1)
     entry = await find_audit_entry(guild, discord.AuditLogAction.ban, user.id)
     if entry is None or entry.user is None:
-        embed = _base_embed("🔨 Ban", discord.Color.red())
-        embed.description = f"{user.mention} (`{user}`) wurde **gebannt** (Verursacher unbekannt)."
-        await send_audit_embed(embed)
+        await log_moderation("🔨 Ban", discord.Color.red(), None, "gebannt", user)
         return
     if bot.user and entry.user.id == bot.user.id:
         return
@@ -542,11 +556,14 @@ async def on_member_update(before, after):
         return
 
     if after.timed_out_until and after.timed_out_until > discord.utils.utcnow():
-        verb = f"getimeoutet (bis {discord.utils.format_dt(after.timed_out_until, 'f')})"
-        await log_moderation("🔇 Timeout", discord.Color.orange(), entry.user, verb, after, entry.reason)
+        await log_moderation(
+            "🔇 Timeout", discord.Color.orange(), entry.user, "getimeoutet", after,
+            entry.reason,
+            dauer=f"bis {discord.utils.format_dt(after.timed_out_until, 'f')}",
+        )
     else:
         await log_moderation(
-            "🔊 Timeout entfernt", discord.Color.green(), entry.user, "aus dem Timeout geholt", after
+            "🔊 Timeout entfernt", discord.Color.green(), entry.user, "Timeout entfernt", after
         )
 
 
@@ -1684,7 +1701,7 @@ async def untimeout_command(interaction: discord.Interaction, user: discord.Memb
 
     await interaction.response.send_message(f"🔊 Timeout von **{user}** wurde entfernt.")
     await log_moderation(
-        "🔊 Timeout entfernt", discord.Color.green(), interaction.user, "aus dem Timeout geholt", user
+        "🔊 Timeout entfernt", discord.Color.green(), interaction.user, "Timeout entfernt", user
     )
 
 
