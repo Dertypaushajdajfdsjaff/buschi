@@ -55,7 +55,38 @@ intents.members = True
 intents.messages = True
 intents.message_content = True  # Nötig, um gelöschte/bearbeitete Inhalte zu loggen
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+
+class LoggingTree(app_commands.CommandTree):
+    """Loggt jeden Slash-Command ins Audit-Log und fängt alle Fehler zentral ab."""
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        try:
+            await log_slash_command(interaction)
+        except Exception as error:
+            print(f"Fehler beim Loggen des Slash-Commands: {type(error).__name__}: {error}")
+        return True
+
+    async def on_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        if isinstance(error, app_commands.MissingPermissions):
+            text = "❌ Dir fehlen die nötigen Berechtigungen für diesen Befehl."
+        elif isinstance(error, app_commands.BotMissingPermissions):
+            text = "❌ Mir fehlen die nötigen Berechtigungen für diesen Befehl."
+        else:
+            name = interaction.command.qualified_name if interaction.command else "?"
+            print(f"Fehler bei /{name}: {type(error).__name__}: {error}")
+            traceback.print_exception(type(error), error, error.__traceback__)
+            text = "❌ Es ist ein unerwarteter Fehler aufgetreten."
+
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(text, ephemeral=True)
+            else:
+                await interaction.response.send_message(text, ephemeral=True)
+        except discord.HTTPException:
+            pass
+
+
+bot = commands.Bot(command_prefix="!", intents=intents, tree_cls=LoggingTree)
 
 # ============================================================
 # VOICE-PING SYSTEM
@@ -378,6 +409,147 @@ async def on_guild_channel_update(before, after):
     await send_audit_embed(embed)
 
 
+# ---------- NEU: Slash-Commands, Moderation, Verlassen ----------
+async def find_audit_entry(guild, action, target_id=None, max_age=15):
+    """Wie find_audit_executor, gibt aber den kompletten Eintrag zurück
+    (Verursacher UND Grund)."""
+    if guild is None:
+        return None
+
+    try:
+        async for entry in guild.audit_logs(limit=5, action=action):
+            alter = (discord.utils.utcnow() - entry.created_at).total_seconds()
+            if alter > max_age:
+                break
+            if target_id is not None and getattr(entry.target, "id", None) != target_id:
+                continue
+            return entry
+    except discord.Forbidden:
+        print("WARNUNG: Bot hat keine Berechtigung 'Audit-Log anzeigen'.")
+    except Exception as error:
+        print(f"Fehler beim Lesen des Audit-Logs: {type(error).__name__}: {error}")
+
+    return None
+
+
+def _option_to_text(value):
+    if isinstance(value, (discord.Member, discord.User)):
+        return f"{value} ({value.id})"
+    if isinstance(value, (discord.abc.GuildChannel, discord.Role)):
+        return f"{value.name} ({value.id})"
+    return str(value)
+
+
+async def log_slash_command(interaction: discord.Interaction):
+    """Loggt jeden benutzten Slash-Command (wird vom LoggingTree aufgerufen)."""
+    command = interaction.command
+    name = command.qualified_name if command else interaction.data.get("name", "?")
+
+    try:
+        optionen = " ".join(f"{k}: {_option_to_text(v)}" for k, v in interaction.namespace)
+    except Exception:
+        optionen = ""
+
+    befehl = f"/{name} {optionen}".strip()
+
+    embed = _base_embed("⌨️ Slash-Command benutzt", discord.Color.blurple())
+    embed.add_field(
+        name="Nutzer",
+        value=f"{interaction.user.mention} (`{interaction.user}`)",
+        inline=True,
+    )
+    embed.add_field(name="Kanal", value=f"<#{interaction.channel_id}>", inline=True)
+    embed.add_field(name="Befehl", value=f"`{_truncate(befehl, 900)}`", inline=False)
+    embed.set_footer(text=f"User-ID: {interaction.user.id}")
+    await send_audit_embed(embed)
+
+
+async def log_moderation(title, color, actor, verb, target, grund=None, dauer=None):
+    """z.B. 'Spieler 1 hat Spieler 2 gebannt für: Spam'."""
+    text = f"{actor.mention} (`{actor}`) hat {target.mention} (`{target}`) **{verb}**"
+    if dauer:
+        text += f" für **{dauer}**"
+    if grund:
+        text += f" – Grund: **{grund}**" if dauer else f" für: **{grund}**"
+
+    embed = _base_embed(title, color)
+    embed.description = text
+    embed.set_footer(text=f"Ziel-ID: {target.id}")
+    await send_audit_embed(embed)
+
+
+# Manuelle Aktionen direkt in Discord (nicht über den Bot). Aktionen, die der
+# Bot selbst ausführt (/ban, /kick, ...), loggen sich in den Commands selbst
+# und werden hier übersprungen, damit nichts doppelt erscheint.
+@bot.event
+async def on_member_ban(guild, user):
+    await asyncio.sleep(1)
+    entry = await find_audit_entry(guild, discord.AuditLogAction.ban, user.id)
+    if entry is None or entry.user is None:
+        embed = _base_embed("🔨 Ban", discord.Color.red())
+        embed.description = f"{user.mention} (`{user}`) wurde **gebannt** (Verursacher unbekannt)."
+        await send_audit_embed(embed)
+        return
+    if bot.user and entry.user.id == bot.user.id:
+        return
+    await log_moderation("🔨 Ban", discord.Color.red(), entry.user, "gebannt", user, entry.reason)
+
+
+@bot.event
+async def on_member_unban(guild, user):
+    await asyncio.sleep(1)
+    entry = await find_audit_entry(guild, discord.AuditLogAction.unban, user.id)
+    if entry is None or entry.user is None:
+        return
+    if bot.user and entry.user.id == bot.user.id:
+        return
+    await log_moderation("🔓 Unban", discord.Color.green(), entry.user, "entbannt", user, entry.reason)
+
+
+@bot.event
+async def on_member_remove(member):
+    await asyncio.sleep(1.5)
+
+    kick = await find_audit_entry(member.guild, discord.AuditLogAction.kick, member.id)
+    if kick is not None and kick.user is not None:
+        if not (bot.user and kick.user.id == bot.user.id):
+            await log_moderation("👢 Kick", discord.Color.orange(), kick.user, "gekickt", member, kick.reason)
+        return
+
+    ban = await find_audit_entry(member.guild, discord.AuditLogAction.ban, member.id)
+    if ban is not None:
+        return  # wird über on_member_ban geloggt
+
+    embed = _base_embed("🚪 Mitglied hat den Server verlassen", discord.Color.dark_grey())
+    embed.description = f"{member.mention} (`{member}`) hat den Server verlassen."
+    if member.joined_at:
+        embed.add_field(name="Beigetreten", value=discord.utils.format_dt(member.joined_at, "R"), inline=True)
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.set_footer(text=f"User-ID: {member.id}")
+    await send_audit_embed(embed)
+
+
+@bot.event
+async def on_member_update(before, after):
+    if before.timed_out_until == after.timed_out_until:
+        return
+
+    await asyncio.sleep(1)
+    entry = await find_audit_entry(after.guild, discord.AuditLogAction.member_update, after.id)
+    if entry is None or entry.user is None:
+        return
+    if bot.user and entry.user.id == bot.user.id:
+        return
+
+    if after.timed_out_until and after.timed_out_until > discord.utils.utcnow():
+        verb = f"getimeoutet (bis {discord.utils.format_dt(after.timed_out_until, 'f')})"
+        await log_moderation("🔇 Timeout", discord.Color.orange(), entry.user, verb, after, entry.reason)
+    else:
+        await log_moderation(
+            "🔊 Timeout entfernt", discord.Color.green(), entry.user, "aus dem Timeout geholt", after
+        )
+
+
 # ============================================================
 # /CLEAR
 # ============================================================
@@ -434,28 +606,6 @@ async def clear(interaction: discord.Interaction, anzahl: app_commands.Range[int
         f"{'Nachricht wurde' if anzahl_geloescht == 1 else 'Nachrichten wurden'} gelöscht.",
         ephemeral=True,
     )
-
-
-@clear.error
-async def clear_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message(
-            "❌ Du brauchst die Berechtigung **Nachrichten verwalten**, "
-            "um diesen Befehl zu nutzen.",
-            ephemeral=True,
-        )
-        return
-
-    print(f"Fehler bei /clear: {type(error).__name__}: {error}")
-
-    if interaction.response.is_done():
-        await interaction.followup.send(
-            "❌ Es ist ein unerwarteter Fehler aufgetreten.", ephemeral=True
-        )
-    else:
-        await interaction.response.send_message(
-            "❌ Es ist ein unerwarteter Fehler aufgetreten.", ephemeral=True
-        )
 
 
 # ============================================================
@@ -727,10 +877,14 @@ class GuildMusicState:
         self.disconnect_task = None
         self.status_channel_id = None
         self.status_text = None
+        # True, solange ein Song vorbereitet (vorgepuffert) wird. Verhindert, dass
+        # zwei gleichzeitige /play-Befehle beide voice_client.play() aufrufen.
+        self.starting = False
 
     def is_active(self):
-        return self.voice_client is not None and (
-            self.voice_client.is_playing() or self.voice_client.is_paused()
+        return self.starting or (
+            self.voice_client is not None
+            and (self.voice_client.is_playing() or self.voice_client.is_paused())
         )
 
 
@@ -1023,12 +1177,14 @@ async def play_next_track(state):
         await play_next_track(state)
         return
 
+    state.starting = True
     buffered = None
     try:
         buffered = BufferedAudio(discord.FFmpegPCMAudio(next_track.filepath, **FFMPEG_OPTIONS))
         await asyncio.to_thread(buffered.wait_ready, 5.0)
         source = discord.PCMVolumeTransformer(buffered, volume=state.volume)
     except Exception as error:
+        state.starting = False
         print(f"Fehler beim Erstellen der Audio-Quelle: {error}")
         if buffered is not None:
             buffered.cleanup()
@@ -1037,6 +1193,7 @@ async def play_next_track(state):
 
     # Während des Vorpufferns kann der Bot gestoppt worden sein.
     if state.voice_client is None or not state.voice_client.is_connected():
+        state.starting = False
         source.cleanup()
         return
 
@@ -1046,6 +1203,7 @@ async def play_next_track(state):
         asyncio.run_coroutine_threadsafe(play_next_track(state), bot.loop)
 
     state.voice_client.play(source, after=after_playback)
+    state.starting = False
     state.play_started_at = time.time()
     state.paused_at_elapsed = 0
     bot.loop.create_task(update_voice_status(state, next_track))
@@ -1431,19 +1589,14 @@ async def ban_command(interaction: discord.Interaction, user: discord.Member, gr
 
     try:
         await user.ban(reason=f"{grund} | Von {interaction.user}")
-        await interaction.response.send_message(
-            f"🔨 **{user}** wurde gebannt.\n📝 Grund: **{grund}**"
-        )
     except discord.Forbidden:
         await interaction.response.send_message("❌ Ich darf diesen User nicht bannen.", ephemeral=True)
+        return
 
-
-@ban_command.error
-async def ban_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ Du brauchst **Mitglieder bannen**.", ephemeral=True)
-    else:
-        print(f"Fehler bei /ban: {type(error).__name__}: {error}")
+    await interaction.response.send_message(
+        f"🔨 **{user}** wurde gebannt.\n📝 Grund: **{grund}**"
+    )
+    await log_moderation("🔨 Ban", discord.Color.red(), interaction.user, "gebannt", user, grund)
 
 
 @bot.tree.command(name="unban", description="Hebt den Bann eines Users per Discord-ID auf.")
@@ -1457,21 +1610,18 @@ async def unban_command(interaction: discord.Interaction, user_id: str, grund: s
     try:
         user = await bot.fetch_user(int(user_id))
         await interaction.guild.unban(user, reason=f"{grund} | Von {interaction.user}")
-        await interaction.response.send_message(f"🔓 **{user}** wurde entbannt.\n📝 Grund: **{grund}**")
     except ValueError:
         await interaction.response.send_message("❌ Bitte eine gültige Discord-ID eingeben.", ephemeral=True)
+        return
     except discord.NotFound:
         await interaction.response.send_message("❌ Dieser User ist nicht gebannt oder wurde nicht gefunden.", ephemeral=True)
+        return
     except discord.Forbidden:
         await interaction.response.send_message("❌ Ich darf keine Banns aufheben.", ephemeral=True)
+        return
 
-
-@unban_command.error
-async def unban_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ Du brauchst **Mitglieder bannen**.", ephemeral=True)
-    else:
-        print(f"Fehler bei /unban: {type(error).__name__}: {error}")
+    await interaction.response.send_message(f"🔓 **{user}** wurde entbannt.\n📝 Grund: **{grund}**")
+    await log_moderation("🔓 Unban", discord.Color.green(), interaction.user, "entbannt", user, grund)
 
 
 @bot.tree.command(name="kick", description="Kickt einen User vom Server.")
@@ -1483,17 +1633,12 @@ async def kick_command(interaction: discord.Interaction, user: discord.Member, g
 
     try:
         await user.kick(reason=f"{grund} | Von {interaction.user}")
-        await interaction.response.send_message(f"👢 **{user}** wurde gekickt.\n📝 Grund: **{grund}**")
     except discord.Forbidden:
         await interaction.response.send_message("❌ Ich darf diesen User nicht kicken.", ephemeral=True)
+        return
 
-
-@kick_command.error
-async def kick_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ Du brauchst **Mitglieder kicken**.", ephemeral=True)
-    else:
-        print(f"Fehler bei /kick: {type(error).__name__}: {error}")
+    await interaction.response.send_message(f"👢 **{user}** wurde gekickt.\n📝 Grund: **{grund}**")
+    await log_moderation("👢 Kick", discord.Color.orange(), interaction.user, "gekickt", user, grund)
 
 
 @bot.tree.command(name="timeout", description="Gibt einem User einen Timeout in Minuten.")
@@ -1511,19 +1656,17 @@ async def timeout_command(
     try:
         until = discord.utils.utcnow() + timedelta(minutes=minuten)
         await user.timeout(until, reason=f"{grund} | Von {interaction.user}")
-        await interaction.response.send_message(
-            f"🔇 **{user}** wurde für **{minuten} Minuten** getimeoutet.\n📝 Grund: **{grund}**"
-        )
     except discord.Forbidden:
         await interaction.response.send_message("❌ Ich darf diesen User nicht timeouten.", ephemeral=True)
+        return
 
-
-@timeout_command.error
-async def timeout_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ Du brauchst **Mitglieder moderieren**.", ephemeral=True)
-    else:
-        print(f"Fehler bei /timeout: {type(error).__name__}: {error}")
+    await interaction.response.send_message(
+        f"🔇 **{user}** wurde für **{minuten} Minuten** getimeoutet.\n📝 Grund: **{grund}**"
+    )
+    await log_moderation(
+        "🔇 Timeout", discord.Color.orange(), interaction.user, "getimeoutet", user, grund,
+        dauer=f"{minuten} Minuten",
+    )
 
 
 @bot.tree.command(name="untimeout", description="Entfernt den Timeout eines Users.")
@@ -1535,17 +1678,14 @@ async def untimeout_command(interaction: discord.Interaction, user: discord.Memb
 
     try:
         await user.timeout(None, reason=f"Timeout entfernt | Von {interaction.user}")
-        await interaction.response.send_message(f"🔊 Timeout von **{user}** wurde entfernt.")
     except discord.Forbidden:
         await interaction.response.send_message("❌ Ich darf den Timeout nicht entfernen.", ephemeral=True)
+        return
 
-
-@untimeout_command.error
-async def untimeout_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ Du brauchst **Mitglieder moderieren**.", ephemeral=True)
-    else:
-        print(f"Fehler bei /untimeout: {type(error).__name__}: {error}")
+    await interaction.response.send_message(f"🔊 Timeout von **{user}** wurde entfernt.")
+    await log_moderation(
+        "🔊 Timeout entfernt", discord.Color.green(), interaction.user, "aus dem Timeout geholt", user
+    )
 
 
 @bot.tree.command(name="warn", description="Verwarnt einen User.")
@@ -1559,20 +1699,13 @@ async def warn_command(interaction: discord.Interaction, user: discord.Member, g
         await user.send(
             f"⚠️ Du wurdest auf **{interaction.guild.name}** verwarnt.\n📝 Grund: **{grund}**"
         )
-    except discord.Forbidden:
+    except (discord.Forbidden, discord.HTTPException):
         pass
 
     await interaction.response.send_message(
         f"⚠️ **{user}** wurde verwarnt.\n📝 Grund: **{grund}**"
     )
-
-
-@warn_command.error
-async def warn_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ Du brauchst **Mitglieder moderieren**.", ephemeral=True)
-    else:
-        print(f"Fehler bei /warn: {type(error).__name__}: {error}")
+    await log_moderation("⚠️ Warn", discord.Color.gold(), interaction.user, "verwarnt", user, grund)
 
 
 async def _set_channel_lock(interaction: discord.Interaction, locked: bool):
@@ -1603,26 +1736,10 @@ async def lock_command(interaction: discord.Interaction):
     await _set_channel_lock(interaction, True)
 
 
-@lock_command.error
-async def lock_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ Du brauchst **Kanäle verwalten**.", ephemeral=True)
-    else:
-        print(f"Fehler bei /lock: {type(error).__name__}: {error}")
-
-
 @bot.tree.command(name="unlock", description="Entsperrt den aktuellen Textkanal für @everyone.")
 @app_commands.checks.has_permissions(manage_channels=True)
 async def unlock_command(interaction: discord.Interaction):
     await _set_channel_lock(interaction, False)
-
-
-@unlock_command.error
-async def unlock_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ Du brauchst **Kanäle verwalten**.", ephemeral=True)
-    else:
-        print(f"Fehler bei /unlock: {type(error).__name__}: {error}")
 
 
 @bot.tree.command(name="userinfo", description="Zeigt Informationen über einen User.")
@@ -1677,9 +1794,9 @@ STATUS_TEXTE = [
     "🔨 /help for all commands",
 ]
 
-@tasks.loop(seconds=5)
+@tasks.loop(seconds=15)
 async def rotating_bot_status():
-    """Wechselt alle 5 Sekunden den sichtbaren Discord-Bot-Status."""
+    """Wechselt alle 15 Sekunden den sichtbaren Discord-Bot-Status."""
     index = rotating_bot_status.current_loop % len(STATUS_TEXTE)
     await bot.change_presence(
         status=discord.Status.online,
