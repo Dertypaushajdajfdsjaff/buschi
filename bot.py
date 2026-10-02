@@ -1563,6 +1563,8 @@ async def help_command(interaction: discord.Interaction):
             "`/userinfo <user>` – Informationen über einen User\n"
             "`/serverinfo` – Informationen über den Server\n"
             "`/avatar [user]` – Avatar anzeigen\n"
+            "`/bibelvers [stelle/thema]` – Bibelvers suchen mit Bedeutung\n"
+            "`/koranvers [stelle/thema]` – Koranvers suchen mit Bedeutung\n"
             "`/vers` – Vers des Tages jetzt posten (Server verwalten)"
         ),
         inline=False,
@@ -1954,6 +1956,194 @@ async def vers_command(interaction: discord.Interaction):
     await interaction.followup.send(
         "✅ Vers gepostet." if ok else "❌ Vers konnte nicht geladen werden.", ephemeral=True
     )
+
+
+# ============================================================
+# VERS-SUCHE: /bibelvers und /koranvers (Vers + kurze Bedeutung)
+# ============================================================
+# Die Bedeutungen sind kurze, allgemeine Erklärungen. Sie sind keine
+# theologische Auslegung - bei Fragen dazu bitte einen Gelehrten/Pfarrer fragen.
+# Stichworte: damit man auch nach einem Thema suchen kann (z.B. "Angst", "Liebe").
+BIBLE_INFO = {
+    "Psalm 23:1": ("Gott wird mit einem Hirten verglichen, der sich um seine Schafe kümmert. Wer ihm vertraut, darf sich versorgt und geborgen fühlen.", "vertrauen schutz versorgung hirte geborgenheit"),
+    "Psalm 46:2": ("Gott ist ein sicherer Zufluchtsort. Gerade in schweren Zeiten darf man bei ihm Halt und Kraft suchen.", "zuflucht kraft not hilfe angst stärke"),
+    "Psalm 121:1-2": ("Wer Hilfe braucht, schaut nicht auf die Berge, sondern auf Gott, der Schöpfer von allem ist und helfen kann.", "hilfe vertrauen schöpfer hoffnung"),
+    "Psalm 27:1": ("Mit Gott an der Seite muss man sich vor nichts fürchten. Er gibt Orientierung (Licht) und Rettung (Heil).", "angst furcht licht mut sicherheit"),
+    "Psalm 118:24": ("Jeder Tag ist ein Geschenk Gottes. Der Vers lädt dazu ein, den heutigen Tag dankbar und mit Freude zu leben.", "freude dankbarkeit tag glück"),
+    "Johannes 3:16": ("Der wohl bekannteste Vers: Gottes Liebe zu den Menschen ist so groß, dass er seinen Sohn gab. Wer glaubt, bekommt ewiges Leben.", "liebe glaube erlösung ewiges leben jesus"),
+    "Johannes 14:27": ("Jesus schenkt einen inneren Frieden, der anders ist als weltlicher Frieden. Man muss sich nicht ängstigen.", "frieden angst ruhe trost sorge"),
+    "Johannes 8:12": ("Jesus ist das Licht, das Orientierung gibt. Wer ihm folgt, bleibt nicht in der Dunkelheit (Ratlosigkeit, Schuld) stecken.", "licht orientierung nachfolge hoffnung dunkelheit"),
+    "Johannes 15:12": ("Das zentrale Gebot Jesu: Menschen sollen einander so lieben, wie er sie liebt - selbstlos und aufrichtig.", "liebe nächstenliebe gebot gemeinschaft"),
+    "Römer 8:28": ("Für Menschen, die Gott lieben, kann am Ende auch Schweres zum Guten führen. Gott hat einen Plan, auch wenn man ihn nicht sofort sieht.", "vertrauen plan hoffnung schicksal sinn"),
+    "Römer 12:12": ("Ein Rat für schwere Zeiten: die Hoffnung nicht aufgeben, Not mit Geduld tragen und im Gebet dranbleiben.", "hoffnung geduld gebet durchhalten trübsal"),
+    "Römer 15:13": ("Ein Segenswunsch: Wer auf Gott vertraut, soll mit Freude, Frieden und Hoffnung erfüllt werden.", "hoffnung freude frieden segen"),
+    "Philipper 4:13": ("Mit der Kraft, die Christus gibt, ist man auch schwierigen Aufgaben gewachsen. Die Stärke kommt nicht nur aus einem selbst.", "kraft stärke mut herausforderung schaffen"),
+    "Philipper 4:6-7": ("Statt sich Sorgen zu machen, soll man alles im Gebet vor Gott bringen. Das schenkt einen tiefen Frieden.", "sorge angst gebet frieden stress ruhe"),
+    "Jesaja 41:10": ("Gott verspricht: Du bist nicht allein. Er gibt Kraft, hilft und hält fest - deshalb muss man keine Angst haben.", "angst furcht beistand kraft hilfe nicht allein"),
+    "Jesaja 40:31": ("Wer auf Gott hofft, bekommt neue Kraft und wird nicht erschöpft. Das Bild vom Adler steht für Aufschwung und Ausdauer.", "kraft hoffnung erschöpfung müde ausdauer"),
+    "Josua 1:9": ("Ein Zuspruch an Josua: Sei mutig, denn Gott ist bei dir - egal, wohin du gehst.", "mut angst nicht allein neuanfang entschlossenheit"),
+    "Sprüche 3:5-6": ("Man soll Gott mehr vertrauen als nur dem eigenen Verstand. Wer ihn in allen Entscheidungen einbezieht, wird richtig geführt.", "vertrauen entscheidung führung weisheit"),
+    "Sprüche 16:3": ("Wer seine Pläne und Arbeit Gott anvertraut, darf darauf hoffen, dass sie gelingen.", "arbeit pläne erfolg vertrauen"),
+    "Matthäus 5:9": ("Menschen, die Streit schlichten und Frieden stiften, werden von Gott besonders geehrt.", "frieden versöhnung streit gewaltlosigkeit"),
+    "Matthäus 6:34": ("Jesus rät, sich nicht ständig um die Zukunft zu sorgen. Jeder Tag hat genug eigene Aufgaben.", "sorge angst zukunft gelassenheit stress"),
+    "Matthäus 11:28": ("Jesus lädt alle ein, die erschöpft und belastet sind. Bei ihm darf man zur Ruhe kommen.", "erschöpfung last ruhe trost burnout müde"),
+    "Matthäus 7:7": ("Ein Ermutigung zum Gebet und zur Suche: Wer ernsthaft bittet, sucht und anklopft, wird nicht ohne Antwort bleiben.", "gebet bitten suchen antwort ermutigung"),
+    "1 Korinther 13:4-7": ("Das 'Hohelied der Liebe': Es beschreibt, wie echte Liebe aussieht - geduldig, freundlich, nicht eifersüchtig und nie aufgebend.", "liebe geduld beziehung hochzeit freundlichkeit"),
+    "1 Korinther 13:13": ("Von Glaube, Hoffnung und Liebe ist die Liebe das Wichtigste, denn sie verbindet alles.", "liebe glaube hoffnung"),
+    "Galater 5:22-23": ("Aufzählung der 'Früchte des Geistes': Wer mit Gott lebt, zeigt Eigenschaften wie Liebe, Freude, Frieden, Geduld und Güte.", "charakter liebe freude geduld güte frieden"),
+    "Epheser 2:8": ("Man wird nicht durch eigene Leistung gerettet, sondern aus Gnade. Der Glaube ist ein Geschenk Gottes.", "gnade glaube geschenk rettung erlösung"),
+    "Hebräer 11:1": ("Glaube heißt, fest auf etwas zu vertrauen, das man hofft und nicht sehen kann.", "glaube vertrauen zweifel hoffnung zuversicht"),
+    "Jakobus 1:5": ("Wer nicht weiter weiß, darf Gott um Weisheit bitten. Er gibt großzügig und macht keine Vorwürfe.", "weisheit entscheidung rat gebet hilfe"),
+    "1 Johannes 4:19": ("Unsere Liebe ist eine Antwort: Gott hat zuerst geliebt, deshalb können wir lieben.", "liebe gott dankbarkeit"),
+    "2 Timotheus 1:7": ("Gott schenkt keine Angst, sondern Kraft, Liebe und Besonnenheit.", "angst mut kraft selbstbeherrschung furcht"),
+    "Klagelieder 3:22-23": ("Selbst in dunklen Zeiten bleibt Gottes Güte bestehen. Sie erneuert sich jeden Morgen.", "hoffnung neuanfang treue trost güte morgen"),
+    "Micha 6:8": ("Kurz gesagt, was Gott will: gerecht handeln, Güte lieben und demütig mit ihm leben.", "gerechtigkeit güte demut gebot leben"),
+    "Prediger 3:1": ("Alles im Leben hat seine Zeit - Freude und Trauer, Anfang und Ende. Das hilft, Veränderungen anzunehmen.", "zeit veränderung geduld trauer abschied"),
+    "5 Mose 31:6": ("Mose macht dem Volk Mut: Gott begleitet sie und lässt sie nicht im Stich.", "mut angst nicht allein beistand treue"),
+}
+
+# (Sure, Vers, Titel, Bedeutung, Stichworte)
+QURAN_INFO = [
+    (2, 255, "Der Thronvers (Ayat al-Kursi)", "Beschreibt Allahs Allmacht und Allwissen: Er schläft nie, und alles gehört ihm. Der Vers wird oft zum Schutz rezitiert.", "schutz allmacht thron macht wissen"),
+    (2, 286, "Keine Last über die Kraft", "Allah verlangt von niemandem mehr, als er tragen kann. Ein Trost, wenn man sich überfordert fühlt.", "kraft last prüfung überforderung schwer"),
+    (94, 6, "Mit der Erschwernis kommt Erleichterung", "Auf schwere Zeiten folgt Erleichterung. Der Vers macht Hoffnung, dass Not nicht für immer bleibt.", "hoffnung erleichterung schwer leid trost not"),
+    (13, 28, "Ruhe im Gedenken an Allah", "Die Herzen finden Ruhe, wenn man sich an Allah erinnert, zum Beispiel im Gebet.", "ruhe frieden angst sorge gebet herz"),
+    (2, 153, "Geduld und Gebet", "Geduld und Gebet sind Hilfsmittel in schwierigen Zeiten. Allah ist mit den Geduldigen.", "geduld gebet hilfe ausdauer"),
+    (2, 186, "Allah ist nah", "Allah ist nah und erhört das Bittgebet, wenn man ihn ruft.", "nähe gebet bitten dua hilfe"),
+    (39, 53, "Nicht an Allahs Barmherzigkeit verzweifeln", "Auch wer Fehler gemacht hat, soll nicht verzweifeln: Allah ist barmherzig und kann vergeben.", "vergebung reue hoffnung verzweiflung sünde barmherzigkeit"),
+    (65, 3, "Gottvertrauen", "Wer auf Allah vertraut, dem genügt Er. Der Vers ermutigt, sich nach dem eigenen Bemühen auf Allah zu verlassen.", "vertrauen tawakkul versorgung sorge"),
+    (49, 13, "Menschen lernen einander kennen", "Allah hat Menschen zu Völkern und Stämmen gemacht, damit sie einander kennenlernen. Wert zeigt sich im Verhalten, nicht in Herkunft.", "gleichheit völker respekt vielfalt herkunft"),
+    (16, 90, "Gerechtigkeit und Güte", "Allah gebietet Gerechtigkeit, Güte und Großzügigkeit gegenüber Verwandten und verbietet Unrecht.", "gerechtigkeit güte großzügigkeit unrecht"),
+    (17, 23, "Güte zu den Eltern", "Neben dem Dienst an Allah steht die Pflicht, die Eltern gut zu behandeln, besonders im Alter.", "eltern familie respekt güte alter"),
+    (2, 152, "Gedenkt Meiner", "Wer sich an Allah erinnert und dankbar ist, dessen gedenkt auch Er.", "erinnerung dankbarkeit gedenken dhikr"),
+    (93, 3, "Dein Herr hat dich nicht verlassen", "Ein Trostvers an den Propheten: Allah hat ihn nicht verlassen. Er gilt auch für alle, die sich allein fühlen.", "trost einsamkeit verlassen traurigkeit allein"),
+]
+QURAN_CACHE = {}
+
+
+def _norm_suche(text):
+    return (text or "").strip().lower().replace(",", ":").replace(".", ":")
+
+
+async def _bibel_autocomplete(interaction: discord.Interaction, current: str):
+    q = _norm_suche(current)
+    treffer = [
+        ref for ref in BIBLE_INFO
+        if not q or q in ref.lower() or q in BIBLE_INFO[ref][1]
+    ]
+    return [app_commands.Choice(name=ref, value=ref) for ref in treffer[:25]]
+
+
+async def _koran_autocomplete(interaction: discord.Interaction, current: str):
+    q = _norm_suche(current)
+    treffer = []
+    for surah, ayah, titel, _, stichworte in QURAN_INFO:
+        label = f"{surah}:{ayah} - {titel}"
+        if not q or q in label.lower() or q in stichworte:
+            treffer.append(app_commands.Choice(name=label[:100], value=f"{surah}:{ayah}"))
+    return treffer[:25]
+
+
+@bot.tree.command(name="bibelvers", description="Sucht einen Bibelvers (Stelle oder Thema) und erklärt kurz seine Bedeutung.")
+@app_commands.describe(suche="Stelle (z.B. Johannes 3:16) oder Thema (z.B. Angst, Liebe). Leer = zufälliger Vers")
+@app_commands.autocomplete(suche=_bibel_autocomplete)
+async def bibelvers_command(interaction: discord.Interaction, suche: str = None):
+    verses = dict(BIBLE_VERSES)
+    q = _norm_suche(suche)
+
+    if not q:
+        treffer = [random.choice(list(BIBLE_INFO))]
+    else:
+        treffer = [ref for ref in BIBLE_INFO if ref.lower() == q]
+        if not treffer:
+            treffer = [ref for ref in BIBLE_INFO if q in ref.lower() or q in BIBLE_INFO[ref][1]]
+
+    if not treffer:
+        await interaction.response.send_message(
+            "❌ Dazu habe ich keinen Vers gefunden. Probiere eine Stelle wie `Johannes 3:16` "
+            "oder ein Thema wie `Angst`, `Liebe`, `Hoffnung` oder `Frieden`. "
+            "Beim Tippen werden dir passende Verse vorgeschlagen.",
+            ephemeral=True,
+        )
+        return
+
+    ref = treffer[0]
+    bedeutung = BIBLE_INFO[ref][0]
+    embed = discord.Embed(
+        title=f"✝️ {ref}",
+        description=f"*{verses[ref]}*",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(name="💡 Bedeutung", value=bedeutung, inline=False)
+    weitere = [r for r in treffer[1:6]]
+    footer = "Lutherbibel 1912"
+    if weitere:
+        footer += " • Weitere Treffer: " + ", ".join(weitere)
+    embed.set_footer(text=footer[:2000])
+    await interaction.response.send_message(embed=embed)
+
+
+async def fetch_quran_ayah(surah, ayah):
+    key = (surah, ayah)
+    if key in QURAN_CACHE:
+        return QURAN_CACHE[key]
+    async with aiohttp.ClientSession() as session:
+        data = await _fetch_json(
+            session, f"https://api.alquran.cloud/v1/ayah/{surah}:{ayah}/editions/{QURAN_EDITIONS}"
+        )
+    arabisch, deutsch = data["data"][0], data["data"][1]
+    result = (arabisch["surah"]["englishName"], arabisch["text"], deutsch["text"])
+    QURAN_CACHE[key] = result
+    return result
+
+
+@bot.tree.command(name="koranvers", description="Sucht einen Koranvers (Stelle oder Thema) und erklärt kurz seine Bedeutung.")
+@app_commands.describe(suche="Stelle (z.B. 2:255) oder Thema (z.B. Geduld, Hoffnung). Leer = zufälliger Vers")
+@app_commands.autocomplete(suche=_koran_autocomplete)
+async def koranvers_command(interaction: discord.Interaction, suche: str = None):
+    q = _norm_suche(suche)
+
+    if not q:
+        treffer = [random.choice(QURAN_INFO)]
+    else:
+        treffer = [e for e in QURAN_INFO if f"{e[0]}:{e[1]}" == q]
+        if not treffer:
+            treffer = [
+                e for e in QURAN_INFO
+                if q in f"{e[0]}:{e[1]} {e[2]}".lower() or q in e[4]
+            ]
+
+    if not treffer:
+        await interaction.response.send_message(
+            "❌ Dazu habe ich keinen Vers gefunden. Probiere eine Stelle wie `2:255` "
+            "oder ein Thema wie `Geduld`, `Hoffnung`, `Vergebung` oder `Vertrauen`. "
+            "Beim Tippen werden dir passende Verse vorgeschlagen.",
+            ephemeral=True,
+        )
+        return
+
+    surah, ayah, titel, bedeutung, _ = treffer[0]
+    await interaction.response.defer()
+
+    try:
+        name, arabisch, deutsch = await fetch_quran_ayah(surah, ayah)
+    except Exception as error:
+        print(f"[Vers] Koran-Suche fehlgeschlagen: {type(error).__name__}: {error}")
+        await interaction.followup.send("❌ Der Vers konnte gerade nicht geladen werden. Versuche es später nochmal.")
+        return
+
+    embed = discord.Embed(
+        title=f"☪️ Sure {surah} ({name}), Vers {ayah}",
+        description=f"{_truncate(arabisch, 700)}\n\n*{_truncate(deutsch, 1000)}*",
+        color=discord.Color.green(),
+    )
+    embed.add_field(name=f"💡 Bedeutung - {titel}", value=bedeutung, inline=False)
+    weitere = [f"{e[0]}:{e[1]}" for e in treffer[1:6]]
+    footer = "Übersetzung: Bubenheim"
+    if weitere:
+        footer += " • Weitere Treffer: " + ", ".join(weitere)
+    embed.set_footer(text=footer[:2000])
+    await interaction.followup.send(embed=embed)
 
 
 # ============================================================
