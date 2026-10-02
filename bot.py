@@ -583,7 +583,7 @@ async def on_member_update(before, after):
 HF_API_TOKEN = os.getenv("HF_API_TOKEN")
 HF_MODEL = os.getenv(
     "HF_MODEL",
-    "Qwen/Qwen2.5-7B-Instruct"
+    "openai/gpt-oss-120b:fastest"
 )
 HF_API_URL = f"https://router.huggingface.co/v1/chat/completions"
 
