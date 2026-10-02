@@ -1812,48 +1812,46 @@ async def avatar_command(interaction: discord.Interaction, user: discord.Member 
 # ============================================================
 # VERS DES TAGES (jeden Tag um 00:00 Uhr Berlin-Zeit)
 # ============================================================
-# Bibel: kuratierte Liste, pro Tag ein anderer Vers (nach Datum, danach wiederholt
-# sich die Liste). Format: (Referenz für die API auf Englisch, Anzeige auf Deutsch).
-# bible-api.com versteht nur englische Buchnamen und hat keine deutsche
-# Übersetzung -> der Bibeltext kommt auf Englisch (World English Bible).
+# Bibel: deutsche Lutherbibel 1912 (gemeinfrei). Pro Tag ein anderer Vers (nach
+# Datum), nach 35 Tagen wiederholt sich die Liste. Eigene Verse kannst du einfach
+# als ("Buch Kapitel:Vers", "Text") ergänzen.
 BIBLE_VERSES = [
-    ("Psalms 23:1", "Psalm 23:1"),
-    ("Psalms 46:1", "Psalm 46:1"),
-    ("Psalms 121:1-2", "Psalm 121:1-2"),
-    ("Psalms 27:1", "Psalm 27:1"),
-    ("Psalms 118:24", "Psalm 118:24"),
-    ("John 3:16", "Johannes 3:16"),
-    ("John 14:27", "Johannes 14:27"),
-    ("John 8:12", "Johannes 8:12"),
-    ("John 15:12", "Johannes 15:12"),
-    ("Romans 8:28", "Römer 8:28"),
-    ("Romans 12:12", "Römer 12:12"),
-    ("Romans 15:13", "Römer 15:13"),
-    ("Philippians 4:13", "Philipper 4:13"),
-    ("Philippians 4:6-7", "Philipper 4:6-7"),
-    ("Isaiah 41:10", "Jesaja 41:10"),
-    ("Isaiah 40:31", "Jesaja 40:31"),
-    ("Joshua 1:9", "Josua 1:9"),
-    ("Proverbs 3:5-6", "Sprüche 3:5-6"),
-    ("Proverbs 16:3", "Sprüche 16:3"),
-    ("Matthew 5:9", "Matthäus 5:9"),
-    ("Matthew 6:34", "Matthäus 6:34"),
-    ("Matthew 11:28", "Matthäus 11:28"),
-    ("Matthew 7:7", "Matthäus 7:7"),
-    ("1 Corinthians 13:4-7", "1 Korinther 13:4-7"),
-    ("1 Corinthians 13:13", "1 Korinther 13:13"),
-    ("Galatians 5:22-23", "Galater 5:22-23"),
-    ("Ephesians 2:8", "Epheser 2:8"),
-    ("Hebrews 11:1", "Hebräer 11:1"),
-    ("James 1:5", "Jakobus 1:5"),
-    ("1 John 4:19", "1 Johannes 4:19"),
-    ("2 Timothy 1:7", "2 Timotheus 1:7"),
-    ("Lamentations 3:22-23", "Klagelieder 3:22-23"),
-    ("Micah 6:8", "Micha 6:8"),
-    ("Ecclesiastes 3:1", "Prediger 3:1"),
-    ("Deuteronomy 31:6", "5 Mose 31:6"),
+    ("Psalm 23:1", "Der HERR ist mein Hirte, mir wird nichts mangeln."),
+    ("Psalm 46:2", "Gott ist unsre Zuversicht und Stärke, eine Hilfe in den großen Nöten, die uns getroffen haben."),
+    ("Psalm 121:1-2", "Ich hebe meine Augen auf zu den Bergen, von welchen mir Hilfe kommt. Meine Hilfe kommt von dem HERRN, der Himmel und Erde gemacht hat."),
+    ("Psalm 27:1", "Der HERR ist mein Licht und mein Heil; vor wem sollte ich mich fürchten? Der HERR ist meines Lebens Kraft; vor wem sollte mir grauen?"),
+    ("Psalm 118:24", "Dies ist der Tag, den der HERR macht; lasset uns freuen und fröhlich darin sein."),
+    ("Johannes 3:16", "Also hat Gott die Welt geliebt, daß er seinen eingeborenen Sohn gab, auf daß alle, die an ihn glauben, nicht verloren werden, sondern das ewige Leben haben."),
+    ("Johannes 14:27", "Den Frieden lasse ich euch, meinen Frieden gebe ich euch. Nicht gebe ich euch, wie die Welt gibt. Euer Herz erschrecke nicht und fürchte sich nicht."),
+    ("Johannes 8:12", "Ich bin das Licht der Welt; wer mir nachfolgt, der wird nicht wandeln in der Finsternis, sondern wird das Licht des Lebens haben."),
+    ("Johannes 15:12", "Das ist mein Gebot, daß ihr euch untereinander liebet, gleichwie ich euch liebe."),
+    ("Römer 8:28", "Wir wissen aber, daß denen, die Gott lieben, alle Dinge zum Besten dienen, denen, die nach dem Vorsatz berufen sind."),
+    ("Römer 12:12", "Seid fröhlich in Hoffnung, geduldig in Trübsal, haltet an am Gebet."),
+    ("Römer 15:13", "Der Gott der Hoffnung aber erfülle euch mit aller Freude und Frieden im Glauben, daß ihr völlige Hoffnung habt durch die Kraft des Heiligen Geistes."),
+    ("Philipper 4:13", "Ich vermag alles durch den, der mich mächtig macht, Christus."),
+    ("Philipper 4:6-7", "Sorget nichts; sondern in allen Dingen lasset eure Bitten im Gebet und Flehen mit Danksagung vor Gott kundwerden! Und der Friede Gottes, welcher höher ist denn alle Vernunft, bewahre eure Herzen und Sinne in Christo Jesu!"),
+    ("Jesaja 41:10", "Fürchte dich nicht, ich bin mit dir; weiche nicht, denn ich bin dein Gott; ich stärke dich, ich helfe dir auch, ich halte dich durch die rechte Hand meiner Gerechtigkeit."),
+    ("Jesaja 40:31", "Aber die auf den HERRN harren, kriegen neue Kraft, daß sie auffahren mit Flügeln wie Adler, daß sie laufen und nicht matt werden, daß sie wandeln und nicht müde werden."),
+    ("Josua 1:9", "Siehe, ich habe dir geboten, daß du getrost und unverzagt seiest. Laß dir nicht grauen und entsetze dich nicht; denn der HERR, dein Gott, ist mit dir in allem, was du tun wirst."),
+    ("Sprüche 3:5-6", "Verlaß dich auf den HERRN von ganzem Herzen, und verlaß dich nicht auf deinen Verstand, sondern gedenke an ihn in allen deinen Wegen, so wird er dich recht führen."),
+    ("Sprüche 16:3", "Befiehl dem HERRN deine Werke, so werden deine Anschläge fortgehen."),
+    ("Matthäus 5:9", "Selig sind die Friedfertigen; denn sie werden Gottes Kinder heißen."),
+    ("Matthäus 6:34", "Darum sorget nicht für den andern Morgen; denn der morgende Tag wird für das Seine sorgen. Es ist genug, daß ein jeglicher Tag seine eigene Plage habe."),
+    ("Matthäus 11:28", "Kommet her zu mir alle, die ihr mühselig und beladen seid; ich will euch erquicken."),
+    ("Matthäus 7:7", "Bittet, so wird euch gegeben; suchet, so werdet ihr finden; klopfet an, so wird euch aufgetan."),
+    ("1 Korinther 13:4-7", "Die Liebe ist langmütig und freundlich, die Liebe eifert nicht, die Liebe treibt nicht Mutwillen, sie bläht sich nicht auf, sie stellt sich nicht ungebärdig, sie suchet nicht das Ihre, sie läßt sich nicht erbittern, sie rechnet das Böse nicht zu, sie freut sich nicht der Ungerechtigkeit, sie freut sich aber der Wahrheit; sie verträgt alles, sie glaubt alles, sie hofft alles, sie duldet alles."),
+    ("1 Korinther 13:13", "Nun aber bleibt Glaube, Hoffnung, Liebe, diese drei; aber die Liebe ist die größte unter ihnen."),
+    ("Galater 5:22-23", "Die Frucht aber des Geistes ist Liebe, Freude, Friede, Geduld, Freundlichkeit, Güte, Glaube, Sanftmut, Keuschheit; wider solche ist das Gesetz nicht."),
+    ("Epheser 2:8", "Denn aus Gnade seid ihr selig geworden durch den Glauben, und dasselbe nicht aus euch: Gottes Gabe ist es;"),
+    ("Hebräer 11:1", "Es ist aber der Glaube eine gewisse Zuversicht des, das man hofft, und ein Nichtzweifeln an dem, das man nicht sieht."),
+    ("Jakobus 1:5", "So aber jemand unter euch Weisheit mangelt, der bitte von Gott, der da gibt einfältiglich jedermann und rückt es niemand auf; so wird sie ihm gegeben werden."),
+    ("1 Johannes 4:19", "Lasset uns ihn lieben; denn er hat uns zuerst geliebt."),
+    ("2 Timotheus 1:7", "Denn Gott hat uns nicht gegeben den Geist der Furcht, sondern der Kraft und der Liebe und der Zucht."),
+    ("Klagelieder 3:22-23", "Die Güte des HERRN ist's, daß wir nicht gar aus sind; seine Barmherzigkeit hat noch kein Ende, sondern sie ist alle Morgen neu, und deine Treue ist groß."),
+    ("Micha 6:8", "Es ist dir gesagt, Mensch, was gut ist und was der HERR von dir fordert, nämlich Gottes Wort halten und Liebe üben und demütig sein vor deinem Gott."),
+    ("Prediger 3:1", "Ein jegliches hat seine Zeit, und alles Vornehmen unter dem Himmel hat seine Stunde."),
+    ("5 Mose 31:6", "Seid getrost und unverzagt, fürchtet euch nicht und laßt euch nicht vor ihnen grauen; denn der HERR, dein Gott, wird selber mit dir wandeln und wird die Hand nicht abtun noch dich verlassen."),
 ]
-BIBLE_TRANSLATION = "web"  # bible-api.com: u.a. "web", "kjv"
 QURAN_EDITIONS = "quran-uthmani,de.bubenheim"  # Arabisch + deutsche Übersetzung
 QURAN_TOTAL_AYAT = 6236
 
@@ -1865,20 +1863,9 @@ async def _fetch_json(session, url):
 
 
 async def fetch_bible_verse(session, datum):
-    start = datum.toordinal() % len(BIBLE_VERSES)
-    for versuch in range(len(BIBLE_VERSES)):
-        api_ref, anzeige = BIBLE_VERSES[(start + versuch) % len(BIBLE_VERSES)]
-        try:
-            data = await _fetch_json(
-                session,
-                f"https://bible-api.com/{api_ref.replace(' ', '+')}?translation={BIBLE_TRANSLATION}",
-            )
-            text = (data.get("text") or "").strip()
-            if text:
-                return anzeige, " ".join(text.split())
-        except Exception as error:
-            print(f"[Vers] Bibel-Abruf für '{api_ref}' fehlgeschlagen: {error}")
-    return None
+    # Kein Internet-Abruf mehr nötig: der Text steht direkt in der Liste.
+    ref, text = BIBLE_VERSES[datum.toordinal() % len(BIBLE_VERSES)]
+    return ref, text
 
 
 async def fetch_quran_verse(session, datum):
@@ -1917,7 +1904,7 @@ async def build_verse_embeds():
                 title="✝️ Bibelvers des Tages",
                 description=f"*{_truncate(text, 1500)}*\n\n— **{ref}**",
                 color=discord.Color.gold(),
-            ).set_footer(text=f"Vers des Tages • {datum_text}")
+            ).set_footer(text=f"Lutherbibel 1912 • {datum_text}")
         )
 
     if quran:
