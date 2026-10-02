@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import queue
+import random
 import sys
 import tempfile
 import threading
@@ -9,8 +10,10 @@ import time
 import traceback
 from collections import deque
 from datetime import datetime, timezone, timedelta
+from datetime import time as dtime
 from zoneinfo import ZoneInfo
 
+import aiohttp
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
@@ -44,6 +47,9 @@ LOCAL_TIMEZONE = ZoneInfo("Europe/Berlin")
 # Kanal-ID, in die das Audit-Log gepostet wird.
 # <-- HIER die Channel-ID deines Log-Kanals eintragen.
 AUDIT_LOG_CHANNEL_ID = 1534701792061816872
+
+# Kanal, in den der "Vers des Tages" um 00:00 Uhr (Berlin) gepostet wird.
+VERSE_CHANNEL_ID = TEXT_CHANNEL_ID 1555651598460518534 # <-- bei Bedarf eigene Kanal-ID eintragen
 
 # ============================================================
 # DISCORD INTENTS
@@ -1556,7 +1562,8 @@ async def help_command(interaction: discord.Interaction):
         value=(
             "`/userinfo <user>` – Informationen über einen User\n"
             "`/serverinfo` – Informationen über den Server\n"
-            "`/avatar [user]` – Avatar anzeigen"
+            "`/avatar [user]` – Avatar anzeigen\n"
+            "`/vers` – Vers des Tages jetzt posten (Server verwalten)"
         ),
         inline=False,
     )
@@ -1803,6 +1810,166 @@ async def avatar_command(interaction: discord.Interaction, user: discord.Member 
 
 
 # ============================================================
+# VERS DES TAGES (jeden Tag um 00:00 Uhr Berlin-Zeit)
+# ============================================================
+# Bibel: kuratierte Liste, pro Tag ein anderer Vers (nach Datum, danach wiederholt
+# sich die Liste). Format: (Referenz für die API auf Englisch, Anzeige auf Deutsch).
+# bible-api.com versteht nur englische Buchnamen und hat keine deutsche
+# Übersetzung -> der Bibeltext kommt auf Englisch (World English Bible).
+BIBLE_VERSES = [
+    ("Psalms 23:1", "Psalm 23:1"),
+    ("Psalms 46:1", "Psalm 46:1"),
+    ("Psalms 121:1-2", "Psalm 121:1-2"),
+    ("Psalms 27:1", "Psalm 27:1"),
+    ("Psalms 118:24", "Psalm 118:24"),
+    ("John 3:16", "Johannes 3:16"),
+    ("John 14:27", "Johannes 14:27"),
+    ("John 8:12", "Johannes 8:12"),
+    ("John 15:12", "Johannes 15:12"),
+    ("Romans 8:28", "Römer 8:28"),
+    ("Romans 12:12", "Römer 12:12"),
+    ("Romans 15:13", "Römer 15:13"),
+    ("Philippians 4:13", "Philipper 4:13"),
+    ("Philippians 4:6-7", "Philipper 4:6-7"),
+    ("Isaiah 41:10", "Jesaja 41:10"),
+    ("Isaiah 40:31", "Jesaja 40:31"),
+    ("Joshua 1:9", "Josua 1:9"),
+    ("Proverbs 3:5-6", "Sprüche 3:5-6"),
+    ("Proverbs 16:3", "Sprüche 16:3"),
+    ("Matthew 5:9", "Matthäus 5:9"),
+    ("Matthew 6:34", "Matthäus 6:34"),
+    ("Matthew 11:28", "Matthäus 11:28"),
+    ("Matthew 7:7", "Matthäus 7:7"),
+    ("1 Corinthians 13:4-7", "1 Korinther 13:4-7"),
+    ("1 Corinthians 13:13", "1 Korinther 13:13"),
+    ("Galatians 5:22-23", "Galater 5:22-23"),
+    ("Ephesians 2:8", "Epheser 2:8"),
+    ("Hebrews 11:1", "Hebräer 11:1"),
+    ("James 1:5", "Jakobus 1:5"),
+    ("1 John 4:19", "1 Johannes 4:19"),
+    ("2 Timothy 1:7", "2 Timotheus 1:7"),
+    ("Lamentations 3:22-23", "Klagelieder 3:22-23"),
+    ("Micah 6:8", "Micha 6:8"),
+    ("Ecclesiastes 3:1", "Prediger 3:1"),
+    ("Deuteronomy 31:6", "5 Mose 31:6"),
+]
+BIBLE_TRANSLATION = "web"  # bible-api.com: u.a. "web", "kjv"
+QURAN_EDITIONS = "quran-uthmani,de.bubenheim"  # Arabisch + deutsche Übersetzung
+QURAN_TOTAL_AYAT = 6236
+
+
+async def _fetch_json(session, url):
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+        resp.raise_for_status()
+        return await resp.json()
+
+
+async def fetch_bible_verse(session, datum):
+    start = datum.toordinal() % len(BIBLE_VERSES)
+    for versuch in range(len(BIBLE_VERSES)):
+        api_ref, anzeige = BIBLE_VERSES[(start + versuch) % len(BIBLE_VERSES)]
+        try:
+            data = await _fetch_json(
+                session,
+                f"https://bible-api.com/{api_ref.replace(' ', '+')}?translation={BIBLE_TRANSLATION}",
+            )
+            text = (data.get("text") or "").strip()
+            if text:
+                return anzeige, " ".join(text.split())
+        except Exception as error:
+            print(f"[Vers] Bibel-Abruf für '{api_ref}' fehlgeschlagen: {error}")
+    return None
+
+
+async def fetch_quran_verse(session, datum):
+    rng = random.Random(datum.toordinal())  # pro Tag fester, aber "zufälliger" Vers
+    for _ in range(8):
+        nummer = rng.randint(1, QURAN_TOTAL_AYAT)
+        try:
+            data = await _fetch_json(
+                session, f"https://api.alquran.cloud/v1/ayah/{nummer}/editions/{QURAN_EDITIONS}"
+            )
+            arabisch, deutsch = data["data"][0], data["data"][1]
+            if len(deutsch["text"]) < 40:  # zu kurze Verse (z.B. nur Buchstaben) überspringen
+                continue
+            surah = arabisch["surah"]
+            ref = f"Sure {surah['number']} ({surah['englishName']}), Vers {arabisch['numberInSurah']}"
+            return ref, arabisch["text"], deutsch["text"]
+        except Exception as error:
+            print(f"[Vers] Koran-Abruf für Ayah {nummer} fehlgeschlagen: {error}")
+    return None
+
+
+async def build_verse_embeds():
+    datum = datetime.now(LOCAL_TIMEZONE).date()
+    datum_text = datum.strftime("%d.%m.%Y")
+
+    async with aiohttp.ClientSession() as session:
+        bible = await fetch_bible_verse(session, datum)
+        quran = await fetch_quran_verse(session, datum)
+
+    embeds = []
+
+    if bible:
+        ref, text = bible
+        embeds.append(
+            discord.Embed(
+                title="✝️ Bibelvers des Tages",
+                description=f"*{_truncate(text, 1500)}*\n\n— **{ref}**",
+                color=discord.Color.gold(),
+            ).set_footer(text=f"Vers des Tages • {datum_text}")
+        )
+
+    if quran:
+        ref, arabisch, deutsch = quran
+        embeds.append(
+            discord.Embed(
+                title="☪️ Koranvers des Tages",
+                description=f"{_truncate(arabisch, 700)}\n\n*{_truncate(deutsch, 1000)}*\n\n— **{ref}**",
+                color=discord.Color.green(),
+            ).set_footer(text=f"Vers des Tages • {datum_text}")
+        )
+
+    return embeds
+
+
+async def post_verse_of_the_day(channel):
+    embeds = await build_verse_embeds()
+    if not embeds:
+        print("[Vers] Konnte heute keinen Vers laden.")
+        return False
+    await channel.send(content="📖 **Vers des Tages**", embeds=embeds)
+    return True
+
+
+@tasks.loop(time=dtime(hour=0, minute=0, tzinfo=LOCAL_TIMEZONE))
+async def daily_verse():
+    channel = bot.get_channel(VERSE_CHANNEL_ID)
+    if channel is None:
+        print("[Vers] Vers-Kanal wurde nicht gefunden.")
+        return
+    try:
+        await post_verse_of_the_day(channel)
+    except Exception as error:
+        print(f"[Vers] Fehler beim Posten: {type(error).__name__}: {error}")
+
+
+@daily_verse.before_loop
+async def before_daily_verse():
+    await bot.wait_until_ready()
+
+
+@bot.tree.command(name="vers", description="Postet den heutigen Vers des Tages (zum Testen).")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def vers_command(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    ok = await post_verse_of_the_day(interaction.channel)
+    await interaction.followup.send(
+        "✅ Vers gepostet." if ok else "❌ Vers konnte nicht geladen werden.", ephemeral=True
+    )
+
+
+# ============================================================
 # WECHSELNDER BOT-STATUS
 # ============================================================
 STATUS_TEXTE = [
@@ -1838,6 +2005,7 @@ async def on_ready():
         "Audit-Log-System: "
         f"{'AKTIV -> Kanal-ID ' + str(AUDIT_LOG_CHANNEL_ID) if AUDIT_LOG_CHANNEL_ID else 'NICHT KONFIGURIERT (AUDIT_LOG_CHANNEL_ID setzen)'}"
     )
+    print("Vers-des-Tages: AKTIV (täglich 00:00 Uhr Berlin)")
     print("====================================")
 
     try:
@@ -1848,6 +2016,9 @@ async def on_ready():
 
     if not rotating_bot_status.is_running():
         rotating_bot_status.start()
+
+    if not daily_verse.is_running():
+        daily_verse.start()
 
 
 # ============================================================
