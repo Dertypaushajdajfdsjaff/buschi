@@ -1985,6 +1985,30 @@ BIBLE_VERSES = [
     ("Prediger 3:1", "Ein jegliches hat seine Zeit, und alles Vornehmen unter dem Himmel hat seine Stunde."),
     ("5 Mose 31:6", "Seid getrost und unverzagt, fürchtet euch nicht und laßt euch nicht vor ihnen grauen; denn der HERR, dein Gott, wird selber mit dir wandeln und wird die Hand nicht abtun noch dich verlassen."),
 ]
+# Judentum: Verse aus dem Tanach (Hebräische Bibel). Deutscher Text nach der
+# Lutherbibel 1912 (gemeinfrei). Pro Tag ein anderer Vers (nach Datum).
+JUDAISM_VERSES = [
+    ("5 Mose 6:4 (Schma Jisrael)", "Höre, Israel, der HERR, unser Gott, ist ein einiger HERR."),
+    ("5 Mose 6:5", "Und du sollst den HERRN, deinen Gott, liebhaben von ganzem Herzen, von ganzer Seele, von allem Vermögen."),
+    ("3 Mose 19:18", "Du sollst deinen Nächsten lieben wie dich selbst; ich bin der HERR."),
+    ("5 Mose 16:20", "Was recht ist, dem sollst du nachjagen, auf daß du leben und das Land einnehmen mögest, das dir der HERR, dein Gott, geben wird."),
+    ("1 Mose 1:1", "Am Anfang schuf Gott Himmel und Erde."),
+    ("1 Mose 1:27", "Und Gott schuf den Menschen ihm zum Bilde, zum Bilde Gottes schuf er ihn, und schuf sie ein Männlein und ein Fräulein."),
+    ("Jesaja 2:4", "Und er wird richten unter den Heiden und strafen viele Völker. Da werden sie ihre Schwerter zu Pflugscharen machen und ihre Spieße zu Sicheln. Denn es wird kein Volk wider das andere ein Schwert aufheben, und werden fort nicht mehr kriegen lernen."),
+    ("Psalm 133:1", "Siehe, wie fein und lieblich ist's, daß Brüder einträchtig beieinander wohnen!"),
+    ("Psalm 34:15", "Laß vom Bösen und tue Gutes; suche Frieden und jage ihm nach!"),
+    ("Psalm 90:12", "Lehre uns bedenken, daß wir sterben müssen, auf daß wir klug werden."),
+    ("Psalm 19:2", "Die Himmel erzählen die Ehre Gottes, und die Feste verkündigt seiner Hände Werk."),
+    ("Sprüche 15:1", "Eine linde Antwort stillt den Zorn; aber ein hartes Wort erregt Grimm."),
+    ("Sprüche 17:22", "Ein fröhliches Herz macht das Leben lustig; aber ein betrübter Mut vertrocknet das Gebein."),
+    ("Sprüche 3:17", "Ihre Wege sind liebliche Wege, und alle ihre Steige sind Friede."),
+    ("Jeremia 29:11", "Denn ich weiß wohl, was ich für Gedanken über euch habe, spricht der HERR: Gedanken des Friedens und nicht des Leides, daß ich euch gebe das Ende, deß ihr wartet."),
+    ("Sacharja 4:6", "Es soll nicht durch Heer oder Kraft, sondern durch meinen Geist geschehen, spricht der HERR Zebaoth."),
+    ("2 Mose 20:12", "Du sollst deinen Vater und deine Mutter ehren, auf daß du lange lebest in dem Lande, das dir der HERR, dein Gott, gibt."),
+    ("5 Mose 30:19", "Ich habe euch Leben und Tod, Segen und Fluch vorgelegt, daß du das Leben erwählest und du und dein Same leben mögest."),
+    ("Prediger 4:9", "So ist's ja besser zwei als eins; denn sie genießen doch ihrer Arbeit wohl."),
+    ("Maleachi 2:10", "Haben wir nicht alle einen Vater? Hat uns nicht ein Gott geschaffen?"),
+]
 QURAN_EDITIONS = "quran-uthmani,de.bubenheim"  # Arabisch + deutsche Übersetzung
 QURAN_TOTAL_AYAT = 6236
 
@@ -2049,6 +2073,15 @@ async def build_verse_embeds():
                 color=discord.Color.green(),
             ).set_footer(text=f"Vers des Tages • {datum_text}")
         )
+
+    ref, text = JUDAISM_VERSES[datum.toordinal() % len(JUDAISM_VERSES)]
+    embeds.append(
+        discord.Embed(
+            title="✡️ Tanach-Vers des Tages",
+            description=f"*{_truncate(text, 1500)}*\n\n— **{ref}**",
+            color=discord.Color.blue(),
+        ).set_footer(text=f"Hebräische Bibel (Lutherbibel 1912) • {datum_text}")
+    )
 
     return embeds
 
