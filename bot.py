@@ -49,7 +49,7 @@ LOCAL_TIMEZONE = ZoneInfo("Europe/Berlin")
 AUDIT_LOG_CHANNEL_ID = 1534701792061816872
 
 # Kanal, in den der "Vers des Tages" um 00:00 Uhr (Berlin) gepostet wird.
-VERSE_CHANNEL_ID = TEXT_CHANNEL_ID 1555651598460518534 # <-- bei Bedarf eigene Kanal-ID eintragen
+VERSE_CHANNEL_ID = 1555651598460518534  # <-- bei Bedarf eigene Kanal-ID eintragen
 
 # ============================================================
 # DISCORD INTENTS
