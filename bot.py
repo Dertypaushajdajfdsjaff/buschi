@@ -81,6 +81,36 @@ def is_bot_owner(user) -> bool:
     return user.name.lower() == OWNER_USERNAME.strip().lstrip("@").lower()
 
 
+# Der An/Aus-Zustand wird in einer Datei gespeichert, damit er einen Neustart
+# des Bots überlebt (vorher war der Bot nach jedem Neustart wieder "an").
+# Hinweis Railway: Ohne "Volume" geht die Datei bei einem neuen Deploy verloren.
+# Dann wird der Zustand beim Start aus dem Namen des Status-Kanals gelesen.
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_state.json")
+
+
+def _load_state() -> bool:
+    """Lädt den gespeicherten Zustand. Gibt True zurück, wenn eine Datei gelesen wurde."""
+    global bot_enabled
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            bot_enabled = bool(json.load(f).get("enabled", True))
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _save_state():
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"enabled": bot_enabled}, f)
+    except OSError as error:
+        print(f"Konnte Bot-Zustand nicht speichern: {error}")
+
+
+_state_loaded_from_file = _load_state()
+_state_restored = False
+
+
 class LoggingTree(app_commands.CommandTree):
     """Loggt jeden Slash-Command ins Audit-Log und fängt alle Fehler zentral ab."""
 
@@ -121,10 +151,20 @@ class LoggingTree(app_commands.CommandTree):
 bot = commands.Bot(command_prefix="!", intents=intents, tree_cls=LoggingTree)
 
 # ============================================================
-# BOT-STATUS-KANAL (🟢 An / 🔴 Aus)
+# BOT-STATUS-KATEGORIE (🟢 An / 🔴 Aus)
 # ============================================================
-# Gesperrter Sprachkanal, den niemand betreten kann. Sein Name zeigt den Status.
+# Der Bot erstellt eine eigene Kategorie mit einem gesperrten Sprachkanal,
+# den niemand betreten kann. Der Kanalname zeigt den Status.
+STATUS_CATEGORY_NAME = "🤖｜BOT STATUS"
 STATUS_CHANNEL_PREFIXES = ("🟢｜Bot", "🔴｜Bot")
+_status_lock = None
+
+
+def _get_status_lock():
+    global _status_lock
+    if _status_lock is None:
+        _status_lock = asyncio.Lock()
+    return _status_lock
 
 
 def _status_channel_name():
@@ -132,26 +172,47 @@ def _status_channel_name():
 
 
 async def update_status_channel(guild):
-    """Erstellt den Status-Kanal (falls nötig) und setzt den Namen passend zum Zustand."""
-    name = _status_channel_name()
-    channel = discord.utils.find(
-        lambda c: c.name.startswith(STATUS_CHANNEL_PREFIXES), guild.voice_channels
-    )
+    """Erstellt Kategorie + Status-Kanal (falls nötig) und setzt den Namen passend zum Zustand."""
+    # Lock: mehrere gleichzeitige Updates laufen nacheinander. Der Zielname wird erst
+    # INNERHALB des Locks berechnet, damit ein veraltetes Update nie den falschen
+    # Zustand setzt.
+    async with _get_status_lock():
+        name = _status_channel_name()
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False)
+        }
 
-    try:
-        if channel is None:
-            overwrites = {
-                guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False)
-            }
-            await guild.create_voice_channel(
-                name, overwrites=overwrites, position=0, reason="Bot-Status-Kanal"
+        try:
+            category = discord.utils.get(guild.categories, name=STATUS_CATEGORY_NAME)
+            if category is None:
+                category = await guild.create_category(
+                    STATUS_CATEGORY_NAME,
+                    overwrites=overwrites,
+                    position=0,
+                    reason="Bot-Status-Kategorie",
+                )
+
+            channel = discord.utils.find(
+                lambda c: c.name.startswith(STATUS_CHANNEL_PREFIXES), guild.voice_channels
             )
-        elif channel.name != name:
-            await channel.edit(name=name, reason="Bot-Status geändert")
-    except discord.Forbidden:
-        print("WARNUNG: Bot braucht die Berechtigung 'Kanäle verwalten' für den Status-Kanal.")
-    except Exception as error:
-        print(f"Fehler beim Aktualisieren des Status-Kanals: {type(error).__name__}: {error}")
+
+            if channel is None:
+                await guild.create_voice_channel(
+                    name, category=category, overwrites=overwrites, reason="Bot-Status-Kanal"
+                )
+                return
+
+            if channel.category_id != category.id:
+                await channel.edit(category=category, overwrites=overwrites, reason="Bot-Status-Kanal verschoben")
+
+            if channel.name != name:
+                # Discord erlaubt nur ca. 2 Umbenennungen pro 10 Minuten. Ist das Limit
+                # erreicht, wartet dieser Aufruf automatisch, bis es wieder geht.
+                await channel.edit(name=name, reason="Bot-Status geändert")
+        except discord.Forbidden:
+            print("WARNUNG: Bot braucht die Berechtigung 'Kanäle verwalten' für die Status-Kategorie.")
+        except Exception as error:
+            print(f"Fehler beim Aktualisieren des Status-Kanals: {type(error).__name__}: {error}")
 
 
 async def update_all_status_channels():
@@ -1735,6 +1796,7 @@ async def bot_toggle_command(interaction: discord.Interaction, modus: app_comman
         return
 
     bot_enabled = modus.value == "an"
+    _save_state()
 
     if bot_enabled:
         await interaction.response.send_message(
@@ -2487,10 +2549,26 @@ async def before_rotating_bot_status():
 
 
 # ============================================================
+# STATUS-KANAL ABGLEICH
+# ============================================================
+@tasks.loop(minutes=2)
+async def status_channel_sync():
+    """Gleicht den Namen des Status-Kanals regelmäßig mit dem echten Zustand ab
+    (fängt Umbenennungs-Limits, manuelle Änderungen und Neustarts ab)."""
+    await update_all_status_channels()
+
+
+@status_channel_sync.before_loop
+async def before_status_channel_sync():
+    await bot.wait_until_ready()
+
+
+# ============================================================
 # BOT READY
 # ============================================================
 @bot.event
 async def on_ready():
+    global bot_enabled, _state_restored
     print("====================================")
     print(f"Bot online: {bot.user}")
     print("Voice-Ping-System: AKTIV")
@@ -2511,7 +2589,18 @@ async def on_ready():
     except Exception as error:
         print(f"Fehler beim Synchronisieren: {type(error).__name__}: {error}")
 
-    await update_all_status_channels()
+    # Nur beim ersten Start: Zustand aus dem Status-Kanal lesen, falls keine Datei existiert
+    if not _state_restored:
+        _state_restored = True
+        if not _state_loaded_from_file:
+            for guild in bot.guilds:
+                if discord.utils.find(lambda c: c.name.startswith("🔴｜Bot"), guild.voice_channels):
+                    bot_enabled = False
+                    print("Bot-Zustand aus Status-Kanal wiederhergestellt: AUS")
+                    break
+
+    if not status_channel_sync.is_running():
+        status_channel_sync.start()
 
     if not rotating_bot_status.is_running():
         rotating_bot_status.start()
