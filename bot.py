@@ -61,11 +61,33 @@ intents.members = True
 intents.messages = True
 intents.message_content = True  # Nötig, um gelöschte/bearbeitete Inhalte zu loggen
 
+# ============================================================
+# OWNER / BOT AN-AUS
+# ============================================================
+# Dein Discord-Benutzername (der @name, ohne das @), z.B. "harlem".
+# Das ist NICHT der Anzeigename, sondern der eindeutige Benutzername.
+# Alternativ als Railway-Variable OWNER_USERNAME setzen.
+OWNER_USERNAME = os.getenv("OWNER_USERNAME", "9rd0s")
+
+# True = alle dürfen Befehle nutzen, False = nur der Owner darf Befehle nutzen
+bot_enabled = True
+
+
+class BotDisabled(app_commands.CheckFailure):
+    """Wird geworfen, wenn der Bot ausgeschaltet ist."""
+
+
+def is_bot_owner(user) -> bool:
+    return user.name.lower() == OWNER_USERNAME.strip().lstrip("@").lower()
+
 
 class LoggingTree(app_commands.CommandTree):
     """Loggt jeden Slash-Command ins Audit-Log und fängt alle Fehler zentral ab."""
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not bot_enabled and not is_bot_owner(interaction.user):
+            raise BotDisabled()
+
         try:
             await log_slash_command(interaction)
         except Exception as error:
@@ -73,7 +95,9 @@ class LoggingTree(app_commands.CommandTree):
         return True
 
     async def on_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
-        if isinstance(error, app_commands.MissingPermissions):
+        if isinstance(error, BotDisabled):
+            text = "🔴 Der Bot ist gerade ausgeschaltet. Befehle sind deaktiviert."
+        elif isinstance(error, app_commands.MissingPermissions):
             text = "❌ Dir fehlen die nötigen Berechtigungen für diesen Befehl."
         elif isinstance(error, app_commands.BotMissingPermissions):
             text = "❌ Mir fehlen die nötigen Berechtigungen für diesen Befehl."
@@ -95,6 +119,45 @@ class LoggingTree(app_commands.CommandTree):
 
 
 bot = commands.Bot(command_prefix="!", intents=intents, tree_cls=LoggingTree)
+
+# ============================================================
+# BOT-STATUS-KANAL (🟢 An / 🔴 Aus)
+# ============================================================
+# Gesperrter Sprachkanal, den niemand betreten kann. Sein Name zeigt den Status.
+STATUS_CHANNEL_PREFIXES = ("🟢｜Bot", "🔴｜Bot")
+
+
+def _status_channel_name():
+    return "🟢｜Bot: An" if bot_enabled else "🔴｜Bot: Aus"
+
+
+async def update_status_channel(guild):
+    """Erstellt den Status-Kanal (falls nötig) und setzt den Namen passend zum Zustand."""
+    name = _status_channel_name()
+    channel = discord.utils.find(
+        lambda c: c.name.startswith(STATUS_CHANNEL_PREFIXES), guild.voice_channels
+    )
+
+    try:
+        if channel is None:
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False)
+            }
+            await guild.create_voice_channel(
+                name, overwrites=overwrites, position=0, reason="Bot-Status-Kanal"
+            )
+        elif channel.name != name:
+            await channel.edit(name=name, reason="Bot-Status geändert")
+    except discord.Forbidden:
+        print("WARNUNG: Bot braucht die Berechtigung 'Kanäle verwalten' für den Status-Kanal.")
+    except Exception as error:
+        print(f"Fehler beim Aktualisieren des Status-Kanals: {type(error).__name__}: {error}")
+
+
+async def update_all_status_channels():
+    for guild in bot.guilds:
+        await update_status_channel(guild)
+
 
 # ============================================================
 # VOICE-PING SYSTEM
@@ -1377,6 +1440,12 @@ class MusicControlView(discord.ui.View):
         return get_music_state(self.guild_id)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not bot_enabled and not is_bot_owner(interaction.user):
+            await interaction.response.send_message(
+                "🔴 Der Bot ist gerade ausgeschaltet.", ephemeral=True
+            )
+            return False
+
         state = self.get_state()
         if state.voice_client is None:
             await interaction.response.send_message(
@@ -1647,6 +1716,37 @@ async def music_auto_leave(member, before, after):
     state.current = None
     cancel_update_task(state)
     cancel_auto_disconnect(state)
+
+
+# ============================================================
+# /BOT AN|AUS (nur Owner)
+# ============================================================
+@bot.tree.command(name="bot", description="Schaltet die Bot-Befehle für alle an oder aus (nur Owner).")
+@app_commands.describe(modus="An oder Aus")
+@app_commands.choices(modus=[
+    app_commands.Choice(name="An", value="an"),
+    app_commands.Choice(name="Aus", value="aus"),
+])
+async def bot_toggle_command(interaction: discord.Interaction, modus: app_commands.Choice[str]):
+    global bot_enabled
+
+    if not is_bot_owner(interaction.user):
+        await interaction.response.send_message("❌ Nur der Bot-Owner darf das.", ephemeral=True)
+        return
+
+    bot_enabled = modus.value == "an"
+
+    if bot_enabled:
+        await interaction.response.send_message(
+            "🟢 Bot ist **an**. Jeder kann wieder Befehle ausführen.", ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            "🔴 Bot ist **aus**. Nur du kannst noch Befehle ausführen.", ephemeral=True
+        )
+
+    # Im Hintergrund, weil Discord das Umbenennen von Kanälen stark begrenzt
+    bot.loop.create_task(update_all_status_channels())
 
 
 # ============================================================
@@ -2367,6 +2467,13 @@ STATUS_TEXTE = [
 @tasks.loop(seconds=15)
 async def rotating_bot_status():
     """Wechselt alle 15 Sekunden den sichtbaren Discord-Bot-Status."""
+    if not bot_enabled:
+        await bot.change_presence(
+            status=discord.Status.dnd,
+            activity=discord.Game(name="⛔ Bot ausgeschaltet"),
+        )
+        return
+
     index = rotating_bot_status.current_loop % len(STATUS_TEXTE)
     await bot.change_presence(
         status=discord.Status.online,
@@ -2392,6 +2499,10 @@ async def on_ready():
         f"{'AKTIV -> Kanal-ID ' + str(AUDIT_LOG_CHANNEL_ID) if AUDIT_LOG_CHANNEL_ID else 'NICHT KONFIGURIERT (AUDIT_LOG_CHANNEL_ID setzen)'}"
     )
     print("Vers-des-Tages: AKTIV (täglich 00:00 Uhr Berlin)")
+    print(
+        "Owner-Steuerung: "
+        f"{'AKTIV -> @' + OWNER_USERNAME if OWNER_USERNAME != 'HIER_DEIN_NAME' else 'NICHT KONFIGURIERT (OWNER_USERNAME setzen)'}"
+    )
     print("====================================")
 
     try:
@@ -2399,6 +2510,8 @@ async def on_ready():
         print(f"{len(synced)} Slash Commands synchronisiert.")
     except Exception as error:
         print(f"Fehler beim Synchronisieren: {type(error).__name__}: {error}")
+
+    await update_all_status_channels()
 
     if not rotating_bot_status.is_running():
         rotating_bot_status.start()
