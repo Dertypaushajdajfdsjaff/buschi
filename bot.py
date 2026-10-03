@@ -3,6 +3,7 @@ import json
 import os
 import queue
 import random
+import secrets
 import sys
 import tempfile
 import threading
@@ -576,7 +577,10 @@ async def log_slash_command(interaction: discord.Interaction):
     name = command.qualified_name if command else interaction.data.get("name", "?")
 
     try:
-        optionen = " ".join(f"{k}: {_option_to_text(v)}" for k, v in interaction.namespace)
+        if name in ("entschärfen", "entschaerfen"):
+            optionen = "code: ******"  # Bomben-Code nicht im Log-Kanal zeigen
+        else:
+            optionen = " ".join(f"{k}: {_option_to_text(v)}" for k, v in interaction.namespace)
     except Exception:
         optionen = ""
 
@@ -1854,6 +1858,8 @@ async def help_command(interaction: discord.Interaction):
             "`/userinfo <user>` – Informationen über einen User\n"
             "`/serverinfo` – Informationen über den Server\n"
             "`/avatar [user]` – Avatar anzeigen\n"
+            "`/atombombe` – Spaß-Bombe legen (Code kommt per DM)\n"
+            "`/entschärfen <code>` – Bombe entschärfen\n"
             "`/bibelvers [stelle/thema]` – Bibelvers per KI suchen (z.B. 1. Johannes 4,16)\n"
             "`/koranvers [stelle/thema]` – Koranvers suchen mit Bedeutung\n"
             "`/vers` – Vers des Tages jetzt posten (Server verwalten)"
@@ -2513,6 +2519,260 @@ async def koranvers_command(interaction: discord.Interaction, suche: str = None)
         footer += " • Weitere Treffer: " + ", ".join(weitere)
     embed.set_footer(text=footer[:2000])
     await interaction.followup.send(embed=embed)
+
+
+# ============================================================
+# BOMBEN-SPIEL (/atombombe + /entschärfen)
+# ============================================================
+BOMB_TYPES = {
+    "atombombe": ("☢️ Atombombe", (5, 15)),
+    "wasserstoffbombe": ("💥 Wasserstoffbombe", (15, 40)),
+    "neutronenbombe": ("🧪 Neutronenbombe", (3, 8)),
+    "konfettibombe": ("🎉 Konfetti-Bombe", (1, 3)),
+}  # key: (Anzeigename, (min_radius_km, max_radius_km))
+
+# Land: [(Stadt, Breitengrad, Längengrad), ...]
+BOMB_COUNTRIES = {
+    "Deutschland": [("Berlin", 52.52, 13.405), ("München", 48.137, 11.575), ("Hamburg", 53.551, 9.994)],
+    "Frankreich": [("Paris", 48.857, 2.352), ("Marseille", 43.296, 5.370), ("Lyon", 45.764, 4.836)],
+    "Italien": [("Rom", 41.903, 12.496), ("Mailand", 45.464, 9.190), ("Neapel", 40.852, 14.268)],
+    "Spanien": [("Madrid", 40.417, -3.704), ("Barcelona", 41.385, 2.173), ("Sevilla", 37.389, -5.984)],
+    "Türkei": [("Istanbul", 41.008, 28.978), ("Ankara", 39.933, 32.860), ("Izmir", 38.423, 27.143)],
+    "Polen": [("Warschau", 52.230, 21.012), ("Krakau", 50.065, 19.945)],
+    "Großbritannien": [("London", 51.507, -0.128), ("Manchester", 53.481, -2.243)],
+    "USA": [("New York", 40.713, -74.006), ("Los Angeles", 34.052, -118.244), ("Chicago", 41.878, -87.630)],
+    "Kanada": [("Toronto", 43.653, -79.383), ("Vancouver", 49.283, -123.121)],
+    "Brasilien": [("São Paulo", -23.551, -46.633), ("Rio de Janeiro", -22.907, -43.173)],
+    "Argentinien": [("Buenos Aires", -34.604, -58.382), ("Córdoba", -31.420, -64.188)],
+    "Japan": [("Tokio", 35.676, 139.650), ("Osaka", 34.694, 135.502)],
+    "China": [("Peking", 39.904, 116.407), ("Shanghai", 31.230, 121.474)],
+    "Indien": [("Neu-Delhi", 28.614, 77.209), ("Mumbai", 19.076, 72.878)],
+    "Australien": [("Sydney", -33.869, 151.209), ("Melbourne", -37.814, 144.963)],
+    "Ägypten": [("Kairo", 30.044, 31.236), ("Alexandria", 31.200, 29.919)],
+    "Südafrika": [("Johannesburg", -26.204, 28.047), ("Kapstadt", -33.925, 18.424)],
+    "Mexiko": [("Mexiko-Stadt", 19.433, -99.133), ("Guadalajara", 20.659, -103.349)],
+    "Russland": [("Moskau", 55.756, 37.617), ("Sankt Petersburg", 59.934, 30.336)],
+    "Schweden": [("Stockholm", 59.329, 18.069), ("Göteborg", 57.709, 11.975)],
+}
+
+WRONG_CODE_PENALTY = 0.7  # Restzeit wird bei falschem Code auf 70 % gekürzt
+
+
+class ActiveBomb:
+    def __init__(self, guild_id, planter, art_name, radius, land, stadt, lat, lon, code, end_time, channel):
+        self.guild_id = guild_id
+        self.planter = planter
+        self.art_name = art_name
+        self.radius = radius
+        self.land = land
+        self.stadt = stadt
+        self.lat = lat
+        self.lon = lon
+        self.code = code
+        self.end_time = end_time
+        self.channel = channel
+        self.message = None
+        self.task = None
+        self.wrong_attempts = 0
+
+
+active_bombs = {}  # guild_id -> ActiveBomb
+
+
+def _bomb_embed(bomb, title="💣 Bombe geplant", color=None, extra=None):
+    end_dt = datetime.fromtimestamp(bomb.end_time, tz=timezone.utc)
+    embed = discord.Embed(
+        title=title,
+        color=color or discord.Color.red(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Art der Bombe", value=bomb.art_name, inline=True)
+    embed.add_field(name="Zeit bis zur Explosion", value=discord.utils.format_dt(end_dt, "R"), inline=True)
+    embed.add_field(name="Gelegt von", value=bomb.planter.mention, inline=True)
+    if bomb.wrong_attempts:
+        embed.add_field(name="⚠️ Falsche Codes", value=str(bomb.wrong_attempts), inline=True)
+    embed.description = extra or "Benutze `/entschärfen <code>` um sie zu entschärfen!"
+    return embed
+
+
+async def _bomb_explode(bomb):
+    if active_bombs.get(bomb.guild_id) is bomb:
+        del active_bombs[bomb.guild_id]
+
+    embed = _bomb_embed(
+        bomb,
+        title="💥 BOOM! Die Bombe ist explodiert",
+        color=discord.Color.dark_red(),
+        extra=(
+            f"📍 **Ziel:** {bomb.stadt}, {bomb.land}\n"
+            f"💥 **Zerstörungsradius:** {bomb.radius} km"
+        ),
+    )
+    try:
+        if bomb.message:
+            await bomb.message.edit(embed=embed)
+        await bomb.channel.send(
+            f"💥 **BOOM!** Die {bomb.art_name} von {bomb.planter.mention} ist in "
+            f"**{bomb.stadt} ({bomb.land})** eingeschlagen!"
+        )
+    except discord.HTTPException:
+        pass
+
+
+async def _bomb_countdown(bomb):
+    # end_time kann sich durch falsche Codes verkürzen -> jede Sekunde neu prüfen
+    while True:
+        remaining = bomb.end_time - time.time()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(min(remaining, 1))
+    await _bomb_explode(bomb)
+
+
+async def _land_autocomplete(interaction: discord.Interaction, current: str):
+    q = (current or "").lower()
+    return [
+        app_commands.Choice(name=land, value=land)
+        for land in BOMB_COUNTRIES
+        if q in land.lower()
+    ][:25]
+
+
+@bot.tree.command(name="atombombe", description="Lege eine (Spaß-)Bombe auf ein Land. Viel Spaß beim Entschärfen!")
+@app_commands.describe(art="Welche Bombe?", land="Zielland (aus der Liste wählen)", minuten="Zeit bis zur Explosion in Minuten (1-60)")
+@app_commands.choices(art=[
+    app_commands.Choice(name=v[0], value=k) for k, v in BOMB_TYPES.items()
+])
+@app_commands.autocomplete(land=_land_autocomplete)
+async def atombombe_command(
+    interaction: discord.Interaction,
+    art: app_commands.Choice[str],
+    land: str,
+    minuten: app_commands.Range[int, 1, 60],
+):
+    if interaction.guild is None or interaction.channel is None:
+        await interaction.response.send_message("❌ Nur auf einem Server möglich.", ephemeral=True)
+        return
+
+    land_key = next((l for l in BOMB_COUNTRIES if l.lower() == land.strip().lower()), None)
+    if land_key is None:
+        await interaction.response.send_message(
+            "❌ Dieses Land gibt es in der Liste nicht. Wähle eines aus den Vorschlägen.", ephemeral=True
+        )
+        return
+
+    if interaction.guild.id in active_bombs:
+        await interaction.response.send_message(
+            "❌ Es tickt bereits eine Bombe! Entschärfe sie erst mit `/entschärfen`.", ephemeral=True
+        )
+        return
+
+    art_name, (r_min, r_max) = BOMB_TYPES[art.value]
+    stadt, lat, lon = random.choice(BOMB_COUNTRIES[land_key])
+    lat += random.uniform(-0.05, 0.05)
+    lon += random.uniform(-0.05, 0.05)
+    radius = random.randint(r_min, r_max)
+    code = f"{secrets.randbelow(1_000_000):06d}"
+
+    bomb = ActiveBomb(
+        guild_id=interaction.guild.id,
+        planter=interaction.user,
+        art_name=art_name,
+        radius=radius,
+        land=land_key,
+        stadt=stadt,
+        lat=lat,
+        lon=lon,
+        code=code,
+        end_time=time.time() + minuten * 60,
+        channel=interaction.channel,
+    )
+    active_bombs[interaction.guild.id] = bomb  # sofort reservieren (verhindert Doppel-Bomben)
+
+    await interaction.response.defer(ephemeral=True)
+
+    dm_embed = discord.Embed(title="💣 Deine Bombe", color=discord.Color.red())
+    dm_embed.add_field(name="Art", value=art_name, inline=True)
+    dm_embed.add_field(name="Zeit", value=f"{minuten} Minuten", inline=True)
+    dm_embed.add_field(name="🌍 Ziel", value=f"**{stadt}**, {land_key}", inline=False)
+    dm_embed.add_field(name="💥 Zerstörungsradius", value=f"{radius} km", inline=True)
+    dm_embed.add_field(name="📍 Einschlag-Koordinaten", value=f"`{lat:.4f}, {lon:.4f}`", inline=True)
+    dm_embed.add_field(name="🔑 Entschärf-Code", value=f"||`{code}`||", inline=False)
+    dm_embed.set_footer(text="Gib den Code nur weiter, wenn jemand die Bombe entschärfen soll.")
+
+    try:
+        await interaction.user.send(embed=dm_embed)
+    except (discord.Forbidden, discord.HTTPException):
+        active_bombs.pop(interaction.guild.id, None)
+        await interaction.followup.send(
+            "❌ Ich kann dir keine DM schicken. Aktiviere Direktnachrichten von Servermitgliedern und versuche es nochmal.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        bomb.message = await interaction.channel.send(embed=_bomb_embed(bomb))
+    except discord.HTTPException:
+        active_bombs.pop(interaction.guild.id, None)
+        await interaction.followup.send("❌ Ich konnte die Nachricht nicht in den Kanal senden.", ephemeral=True)
+        return
+
+    bomb.task = bot.loop.create_task(_bomb_countdown(bomb))
+    await interaction.followup.send("✅ Bombe gelegt! Alle Infos und der Code sind in deinen DMs.", ephemeral=True)
+
+
+@bot.tree.command(name="entschärfen", description="Entschärfe die aktive Bombe mit dem Code.")
+@app_commands.describe(code="Der 6-stellige Code aus den DMs des Bomben-Legers")
+async def entschaerfen_command(interaction: discord.Interaction, code: str):
+    if interaction.guild is None:
+        await interaction.response.send_message("❌ Nur auf einem Server möglich.", ephemeral=True)
+        return
+
+    bomb = active_bombs.get(interaction.guild.id)
+    if bomb is None:
+        await interaction.response.send_message("❌ Es tickt gerade keine Bombe.", ephemeral=True)
+        return
+
+    if interaction.user.id == bomb.planter.id:
+        await interaction.response.send_message("❌ Du kannst deine eigene Bombe nicht entschärfen. 😏", ephemeral=True)
+        return
+
+    if secrets.compare_digest(code.strip().encode(), bomb.code.encode()):
+        active_bombs.pop(interaction.guild.id, None)
+        if bomb.task:
+            bomb.task.cancel()
+        embed = _bomb_embed(
+            bomb,
+            title="✅ Bombe entschärft!",
+            color=discord.Color.green(),
+            extra=(
+                f"{interaction.user.mention} hat die Bombe rechtzeitig entschärft!\n"
+                f"📍 Ziel wäre **{bomb.stadt}, {bomb.land}** gewesen."
+            ),
+        )
+        await interaction.response.send_message(embed=embed)
+        if bomb.message:
+            try:
+                await bomb.message.edit(embed=embed)
+            except discord.HTTPException:
+                pass
+        return
+
+    # Falscher Code -> Zeit läuft schneller ab
+    now = time.time()
+    remaining = max(0.0, bomb.end_time - now)
+    bomb.end_time = now + remaining * WRONG_CODE_PENALTY
+    bomb.wrong_attempts += 1
+
+    await interaction.response.send_message(
+        f"❌ **Falscher Code!** {interaction.user.mention} hat den Timer beschleunigt – "
+        f"es bleiben nur noch **{int(remaining * WRONG_CODE_PENALTY)} Sekunden**! ⏱️💨"
+    )
+    if bomb.message:
+        try:
+            await bomb.message.edit(embed=_bomb_embed(bomb))
+        except discord.HTTPException:
+            pass
 
 
 # ============================================================
