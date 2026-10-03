@@ -67,7 +67,7 @@ intents.message_content = True  # Nötig, um gelöschte/bearbeitete Inhalte zu l
 # Dein Discord-Benutzername (der @name, ohne das @), z.B. "harlem".
 # Das ist NICHT der Anzeigename, sondern der eindeutige Benutzername.
 # Alternativ als Railway-Variable OWNER_USERNAME setzen.
-OWNER_USERNAME = os.getenv("OWNER_USERNAME", "9rd0s")
+OWNER_USERNAME = os.getenv("OWNER_USERNAME", "HIER_DEIN_NAME")
 
 # True = alle dürfen Befehle nutzen, False = nur der Owner darf Befehle nutzen
 bot_enabled = True
@@ -485,10 +485,9 @@ def _describe_channel_changes(before, after):
     if before.name != after.name:
         changes.append(("Name", f"`{before.name}`", f"`{after.name}`"))
 
-    before_category = before.category.name if before.category else "Keine"
-    after_category = after.category.name if after.category else "Keine"
-    if before_category != after_category:
-        changes.append(("Kategorie", before_category, after_category))
+    # Verschieben (Position / Kategorie) wird bewusst NICHT geloggt: Ein einziges
+    # Verschieben ändert die Position vieler anderer Kanäle und würde den
+    # Log sonst mit Einträgen fluten.
 
     if isinstance(before, discord.TextChannel) and isinstance(after, discord.TextChannel):
         if before.topic != after.topic:
@@ -504,11 +503,10 @@ def _describe_channel_changes(before, after):
         if before.user_limit != after.user_limit:
             changes.append(("Nutzerlimit", str(before.user_limit), str(after.user_limit)))
 
-    if before.overwrites != after.overwrites:
+    # Beim Verschieben in eine andere Kategorie werden die Rechte oft automatisch
+    # mit der Kategorie synchronisiert -> das zählt nicht als eigene Änderung.
+    if before.category_id == after.category_id and before.overwrites != after.overwrites:
         changes.append(("Berechtigungen", "*(geändert)*", "*(geändert)*"))
-
-    if before.position != after.position:
-        changes.append(("Position", str(before.position), str(after.position)))
 
     return changes
 
